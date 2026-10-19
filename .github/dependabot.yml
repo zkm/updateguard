@@ -1,0 +1,14 @@
+version: 2
+updates:
+  # The only dependencies are the actions used by the workflows; keeps their SHA pins current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    target-branch: master
+    commit-message:
+      prefix: ci
+    groups:
+      # configure-pages, upload-pages-artifact and deploy-pages move together
+      pages:
+        patterns: ["actions/*pages*"]
