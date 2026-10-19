@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+[[ $1 == status ]] && cat "${T_DKMS_FILE:-/dev/null}"

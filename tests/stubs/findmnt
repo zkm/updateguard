@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Test stub. Controlled by T_FSTYPE, T_SOURCE, T_ROOT_UUID, T_MOUNTED, T_BOOT_UUID.
+args="$*"; mp=""; prev=""
+for a in "$@"; do [[ $prev == --mountpoint ]] && mp=$a; prev=$a; done
+if [[ -n $mp ]]; then
+  rel=${mp#"$UG_ROOT"}
+  for m in ${T_MOUNTED:-}; do
+    if [[ $m == "$rel" ]]; then
+      if [[ $args == *UUID* ]]; then echo "${T_BOOT_UUID:-ABCD-1234}"; else echo vfat; fi
+      exit 0
+    fi
+  done
+  exit 1
+fi
+case $args in
+  *FSTYPE*) echo "${T_FSTYPE:-btrfs}" ;;
+  *SOURCE*) echo "${T_SOURCE:-/dev/nvme0n1p2[/@]}" ;;
+  *UUID*)   echo "${T_ROOT_UUID:-1111-2222-3333}" ;;
+esac

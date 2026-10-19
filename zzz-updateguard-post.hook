@@ -1,0 +1,35 @@
+# updateguard: runs after everything else (mkinitcpio, dkms, bootloader hooks)
+# and verifies the system will still boot. Named zzz- so it sorts last.
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = linux
+Target = linux-*
+Target = *-dkms
+Target = dkms
+Target = nvidia
+Target = nvidia-*
+Target = mkinitcpio
+Target = mkinitcpio-*
+Target = dracut
+Target = booster
+Target = systemd
+Target = grub
+Target = limine
+Target = limine-*
+Target = refind
+Target = glibc
+Target = amd-ucode
+Target = intel-ucode
+Target = btrfs-progs
+Target = cryptsetup
+Target = lvm2
+Target = kmod
+
+[Action]
+Description = updateguard: verifying boot health...
+When = PostTransaction
+Exec = /usr/bin/updateguard hook-post
+NeedsTargets

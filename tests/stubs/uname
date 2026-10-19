@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+case $1 in
+  -r) echo "${T_UNAME_R:-6.11.1-zen1-1-zen}" ;;
+  -n) echo testhost ;;
+  *) /usr/bin/uname "$@" ;;
+esac

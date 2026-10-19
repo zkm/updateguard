@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# fake initramfs files are plain-text listings
+[[ $1 == -l ]] && cat "$2"

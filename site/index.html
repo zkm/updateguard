@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon-180.png">
+<title>updateguard</title>
+<meta name="description" content="Snapshot before risky OS updates, then verify the machine will still boot before you reboot.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..800&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column; the hero terminal and the check ledger break out wider. */
+:root {
+  --paper: #eef1f5;
+  --panel: #e3e8ef;
+  --ink: #14213a;
+  --muted: #56627a;
+  --line: #cdd5e0;
+  --signal: #b06a05;
+  --term-bg: #16233a;
+  --term-fg: #dfe6f0;
+  --term-dim: #8796ae;
+  --term-ok: #6fd39a;
+  --term-fail: #ff8a7a;
+  --term-signal: #f2a93b;
+  --f-display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+  --f-body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --f-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #0e1626; --panel: #142037; --ink: #e3e9f2; --muted: #95a2b8; --line: #24324a;
+    --signal: #f2a93b; --term-bg: #0a111d; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #0e1626; --panel: #142037; --ink: #e3e9f2; --muted: #95a2b8; --line: #24324a;
+  --signal: #f2a93b; --term-bg: #0a111d; color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--paper); color: var(--ink);
+  font: 400 1.0625rem/1.6 var(--f-body);
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+.wrap { max-width: 68rem; margin: 0 auto; }
+.col { max-width: 42rem; }
+a { color: inherit; text-decoration-color: var(--signal); text-underline-offset: 3px; }
+:focus-visible { outline: 2px solid var(--signal); outline-offset: 3px; border-radius: 4px; }
+code, pre, .mono { font-family: var(--f-mono); }
+h1, h2, h3 { font-family: var(--f-display); text-wrap: balance; margin: 0; }
+h2 { font-size: clamp(1.6rem, 3.2vw, 2.1rem); font-weight: 750; font-stretch: 85%; letter-spacing: -0.01em; line-height: 1.1; }
+p { margin: 0; }
+.eyebrow { font: 600 0.75rem/1 var(--f-mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--signal); }
+
+/* header */
+.top { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-block: 22px; }
+.brand { display: flex; align-items: center; gap: 10px; font: 700 1.15rem/1 var(--f-display); font-stretch: 90%; text-decoration: none; }
+.brand svg { width: 32px; height: 32px; flex: none; }
+.top nav { display: flex; gap: 20px; font-size: 0.95rem; color: var(--muted); flex-wrap: wrap; }
+.top nav a { text-decoration: none; }
+.top nav a:hover { color: var(--ink); }
+
+/* hero */
+.hero { display: grid; gap: 28px; padding-block: 40px 56px; }
+.hero h1 { font-size: clamp(2.5rem, 7vw, 4.6rem); font-weight: 800; font-stretch: 72%; line-height: 0.98; letter-spacing: -0.015em; max-width: 14ch; }
+.hero h1 em { font-style: normal; color: var(--signal); }
+.lede { font-size: 1.2rem; color: var(--muted); max-width: 38rem; }
+.cta { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+.btn { font: 600 0.95rem/1 var(--f-body); padding: 12px 18px; border-radius: 8px; border: 1px solid var(--ink); background: var(--ink); color: var(--paper); text-decoration: none; cursor: pointer; }
+.btn.ghost { background: transparent; color: var(--ink); border-color: var(--line); }
+
+/* terminal */
+.term { background: var(--term-bg); color: var(--term-fg); border-radius: 12px; overflow: hidden; min-width: 0; box-shadow: 0 1px 0 rgba(0,0,0,.04), 0 18px 40px -24px rgba(10,17,29,.55); }
+.term-bar { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,.07); }
+.tabs { display: flex; gap: 4px; }
+.tab { font: 500 0.8rem/1 var(--f-mono); color: var(--term-dim); background: transparent; border: 0; padding: 7px 10px; border-radius: 6px; cursor: pointer; }
+.tab[aria-selected="true"] { color: var(--term-fg); background: rgba(255,255,255,.08); }
+.term-host { margin-left: auto; font: 400 0.75rem/1 var(--f-mono); color: var(--term-dim); }
+.term pre { margin: 0; padding: 18px 20px 22px; font-size: 0.82rem; line-height: 1.65; overflow-x: auto; }
+.d { color: var(--term-dim); }
+.ok { color: var(--term-ok); }
+.bad { color: var(--term-fail); font-weight: 600; }
+.sig { color: var(--term-signal); font-weight: 600; }
+.cursor { display: inline-block; width: 0.6em; height: 1.1em; vertical-align: -0.2em; background: var(--term-fg); animation: blink 1.1s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .cursor { animation: none; } }
+
+section { padding-block: 56px; border-top: 1px solid var(--line); }
+.sec-head { display: grid; gap: 12px; margin-bottom: 32px; }
+.sec-head p { color: var(--muted); }
+
+/* flow: a real sequence, so it's numbered by phase */
+.flow { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+.step { padding: 22px; display: grid; gap: 10px; align-content: start; min-width: 0; }
+.step + .step { border-left: 1px solid var(--line); }
+.step .when { font: 600 0.72rem/1 var(--f-mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+.step h3 { font-size: 1.25rem; font-weight: 700; font-stretch: 88%; }
+.step ul { margin: 0; padding-left: 1.1em; color: var(--muted); font-size: 0.97rem; display: grid; gap: 6px; }
+.step.mid { background: var(--panel); }
+.step.mid p { color: var(--muted); font-size: 0.97rem; }
+
+/* ledger */
+.ledger { width: 100%; border-collapse: collapse; font-size: 0.97rem; }
+.ledger th { text-align: left; font: 600 0.72rem/1 var(--f-mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); padding: 0 16px 12px 0; border-bottom: 1px solid var(--ink); }
+.ledger td { padding: 14px 16px 14px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+.ledger td:first-child { width: 52%; }
+.ledger td:last-child { color: var(--muted); }
+.ledger code { font-size: 0.86em; background: var(--panel); padding: 1px 5px; border-radius: 4px; }
+.table-scroll { overflow-x: auto; }
+
+/* distros */
+.distros { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+.distro { padding: 20px; border-top: 3px solid var(--line); display: grid; gap: 8px; align-content: start; }
+.distro.live { border-top-color: var(--ink); }
+.distro.preview { border-top-color: var(--signal); }
+.distro h3 { font-size: 1.2rem; font-weight: 700; font-stretch: 88%; }
+.pill { justify-self: start; font: 600 0.7rem/1 var(--f-mono); letter-spacing: 0.08em; text-transform: uppercase; padding: 5px 8px; border-radius: 99px; border: 1px solid currentColor; }
+.live .pill { color: var(--ink); }
+.preview .pill { color: var(--signal); }
+.planned .pill { color: var(--muted); }
+.distro p { color: var(--muted); font-size: 0.95rem; }
+
+/* install */
+.installs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+.install { display: grid; gap: 10px; min-width: 0; }
+.install h3 { font-size: 1.1rem; font-weight: 700; font-stretch: 88%; }
+.code { position: relative; background: var(--term-bg); color: var(--term-fg); border-radius: 10px; min-width: 0; }
+.code pre { margin: 0; padding: 16px 18px; padding-right: 76px; font-size: 0.82rem; line-height: 1.7; overflow-x: auto; }
+.copy { position: absolute; top: 10px; right: 10px; font: 500 0.75rem/1 var(--f-mono); color: var(--term-fg); background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.14); border-radius: 6px; padding: 7px 9px; cursor: pointer; }
+.note { color: var(--muted); font-size: 0.95rem; }
+
+.roadmap { margin: 0; padding: 0; list-style: none; display: grid; gap: 0; counter-reset: r; }
+.roadmap li { display: grid; grid-template-columns: 3rem minmax(0, 1fr); gap: 12px; padding-block: 16px; border-bottom: 1px solid var(--line); counter-increment: r; }
+.roadmap li::before { content: counter(r, decimal-leading-zero); font: 600 0.9rem/1.6 var(--f-mono); color: var(--signal); }
+.roadmap b { font-weight: 600; }
+.roadmap span { color: var(--muted); }
+
+footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: flex; flex-wrap: wrap; gap: 12px 24px; justify-content: space-between; color: var(--muted); font-size: 0.9rem; }
+
+@media (max-width: 760px) {
+  .flow, .distros, .installs { grid-template-columns: minmax(0, 1fr); }
+  .step + .step { border-left: 0; border-top: 1px solid var(--line); }
+  .top nav { display: none; }
+  .ledger td:first-child { width: auto; }
+}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="#top" aria-label="updateguard home">
+      <svg viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" rx="14" fill="#16233a"/><path d="M32 8.5 51.5 15.5V31c0 12.6-8.2 20.8-19.5 25.5C20.7 51.8 12.5 43.6 12.5 31V15.5Z" fill="none" stroke="#f2a93b" stroke-width="4" stroke-linejoin="round"/><path d="M25.6 28.6A9 9 0 1 0 38.4 28.6" fill="none" stroke="#e8edf5" stroke-width="4" stroke-linecap="round"/><path d="M32 22.5V34" stroke="#e8edf5" stroke-width="4" stroke-linecap="round"/></svg>
+      updateguard
+    </a>
+    <nav aria-label="Sections">
+      <a href="#how">How it works</a>
+      <a href="#checks">Checks</a>
+      <a href="#distros">Distros</a>
+      <a href="#install">Install</a>
+    </nav>
+  </header>
+
+  <main id="top">
+    <div class="hero">
+      <p class="eyebrow">Pre-reboot verification for Linux updates</p>
+      <h1>Know it will boot <em>before</em> you reboot.</h1>
+      <p class="lede">updateguard snapshots your system before risky kernel, driver and bootloader updates, then checks that the machine will actually come back up. When something's wrong it says <strong>don't reboot</strong> and prints the command that fixes it.</p>
+      <div class="cta">
+        <a class="btn" href="#install">Install</a>
+        <a class="btn ghost" href="#checks">See what it checks</a>
+      </div>
+
+      <div class="term" role="region" aria-label="Example updateguard output">
+        <div class="term-bar">
+          <div class="tabs" role="tablist" aria-label="Distribution">
+            <button class="tab" role="tab" id="tab-arch" aria-selected="true" aria-controls="out-arch">pacman</button>
+            <button class="tab" role="tab" id="tab-apt" aria-selected="false" aria-controls="out-apt" tabindex="-1">apt</button>
+          </div>
+          <span class="term-host">example output</span>
+        </div>
+<pre id="out-arch" role="tabpanel" aria-labelledby="tab-arch"><span class="d">$</span> sudo pacman -Syu
+<span class="d">(2/4) upgrading linux-zen                          [######################] 100%
+:: Running post-transaction hooks...
+(6/9) Updating linux initcpios...
+(9/9) updateguard: verifying boot health...</span>
+<span class="sig">==&gt;</span> updateguard: verifying boot health
+  [<span class="ok">OK  </span>] /boot is mounted (861 MB free)
+  [<span class="ok">OK  </span>] linux-zen: /boot/EFI/Linux/arch-linux-zen.efi contains installed kernel 7.2.11-zen1-1-zen
+  [<span class="ok">OK  </span>] linux-zen: /boot/vmlinuz-linux-zen matches installed kernel 7.2.11-zen1-1-zen
+  [<span class="bad">FAIL</span>] linux-zen 7.2.11-zen1-1-zen: DKMS module(s) not installed: nvidia
+         <span class="sig">fix:</span> sudo dkms autoinstall -k 7.2.11-zen1-1-zen
+<span class="sig">==&gt;</span> updateguard: <span class="bad">1 problem(s) found. Do NOT reboot</span> until they're fixed (see the fix: lines).
+<span class="d">$</span> <span class="cursor" aria-hidden="true"></span></pre>
+<pre id="out-apt" role="tabpanel" aria-labelledby="tab-apt" hidden><span class="d">$</span> sudo apt upgrade
+<span class="d">Setting up linux-image-6.8.0-45-generic (6.8.0-45.45) ...
+update-initramfs: Generating /boot/initrd.img-6.8.0-45-generic
+Sourcing file `/etc/default/grub'
+done</span>
+<span class="sig">==&gt;</span> updateguard: verifying boot health
+  [<span class="ok">OK  </span>] /boot/efi is mounted (480 MB free)
+  [<span class="ok">OK  </span>] linux-image-6.8.0-45-generic: /boot/vmlinuz-6.8.0-45-generic matches the packaged kernel
+  [<span class="ok">OK  </span>] linux-image-6.8.0-45-generic: /boot/initrd.img-6.8.0-45-generic is current
+  [<span class="bad">FAIL</span>] linux-image-6.8.0-45-generic 6.8.0-45-generic has no headers, so DKMS modules (nvidia) can't build for it
+         <span class="sig">fix:</span> sudo apt install linux-headers-6.8.0-45-generic &amp;&amp; sudo dkms autoinstall -k 6.8.0-45-generic
+<span class="sig">==&gt;</span> updateguard: <span class="bad">1 problem(s) found. Do NOT reboot</span> until they're fixed (see the fix: lines).
+<span class="d">$</span> <span class="cursor" aria-hidden="true"></span></pre>
+      </div>
+    </div>
+
+    <section id="how" aria-labelledby="how-h">
+      <div class="sec-head col">
+        <p class="eyebrow">How it works</p>
+        <h2 id="how-h">It hooks into your package manager on both sides of the update.</h2>
+        <p>It only wakes up for packages that can break booting: kernels, DKMS and NVIDIA drivers, initramfs tools, bootloaders, systemd, glibc, microcode and storage tools. A browser update passes through silently.</p>
+      </div>
+      <div class="flow">
+        <div class="step">
+          <span class="when">Before</span>
+          <h3>Snapshot and pre-flight</h3>
+          <ul>
+            <li>Stops the update if <code>/boot</code> is in fstab but not mounted</li>
+            <li>Snapshots <code>/</code> with snapper, snap-pac or raw btrfs</li>
+            <li>Copies kernel and initramfs off a separate boot partition</li>
+          </ul>
+        </div>
+        <div class="step mid">
+          <span class="when">During</span>
+          <h3>Your update runs</h3>
+          <p>pacman or apt installs packages and runs its own hooks: mkinitcpio or update-initramfs, DKMS builds, bootloader updates.</p>
+        </div>
+        <div class="step">
+          <span class="when">After</span>
+          <h3>Boot-health check</h3>
+          <ul>
+            <li>Runs after every other hook has finished</li>
+            <li>Verifies kernel, initramfs, DKMS, boot entries and free space</li>
+            <li>On failure: don't reboot, here's the fix, here's the rollback</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section id="checks" aria-labelledby="checks-h">
+      <div class="sec-head col">
+        <p class="eyebrow">What it checks</p>
+        <h2 id="checks-h">The failures that turn a routine update into a live USB.</h2>
+      </div>
+      <div class="table-scroll">
+        <table class="ledger">
+          <thead><tr><th scope="col">Check</th><th scope="col">Catches</th></tr></thead>
+          <tbody>
+            <tr><td>The kernel on <code>/boot</code> byte-matches the installed one (or dpkg's md5sum)</td><td>A stale kernel on /boot because the partition wasn't mounted during the update</td></tr>
+            <tr><td>Each initramfs exists, is newer than the kernel package and contains <code>lib/modules/&lt;kver&gt;</code></td><td>An initramfs that wasn't regenerated, or was built for the wrong kernel</td></tr>
+            <tr><td>Each UKI's embedded <code>.linux</code> section matches the installed kernel</td><td>A unified kernel image that wasn't rebuilt</td></tr>
+            <tr><td>Headers are present and every DKMS module is <code>installed</code> for every kernel</td><td>NVIDIA, ZFS or v4l2loopback not built, so a black screen on reboot</td></tr>
+            <tr><td>systemd-boot, GRUB and Limine entries point at files that exist</td><td>Broken or stale boot entries</td></tr>
+            <tr><td>Boot partition free space</td><td>A full ESP truncating initramfs writes</td></tr>
+            <tr><td>The running kernel's modules are still on disk</td><td>The "reboot soon" case before new modules can load</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="distros" aria-labelledby="distros-h">
+      <div class="sec-head col">
+        <p class="eyebrow">Distributions</p>
+        <h2 id="distros-h">Built on Arch, headed for your servers.</h2>
+        <p>Arch updates the kernel and DKMS constantly, which makes it the proving ground. Debian and Ubuntu servers come next, then the RHEL family.</p>
+      </div>
+      <div class="distros">
+        <div class="distro live">
+          <span class="pill">Available</span>
+          <h3>Arch &amp; CachyOS</h3>
+          <p>pacman hooks, mkinitcpio images and UKIs, systemd-boot, GRUB and Limine. Snapshots with snapper, snap-pac or raw btrfs.</p>
+        </div>
+        <div class="distro preview">
+          <span class="pill">Preview</span>
+          <h3>Debian &amp; Ubuntu</h3>
+          <p>apt hooks, dpkg-verified kernels, initramfs-tools and GRUB. Most servers run ext4, so it verifies even where it can't snapshot.</p>
+        </div>
+        <div class="distro planned">
+          <span class="pill">Planned</span>
+          <h3>Rocky, Alma &amp; Fedora</h3>
+          <p>A dnf plugin, dracut images, <code>kernel-install</code> and BLS entries, and snapper on Fedora's btrfs.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="install" aria-labelledby="install-h">
+      <div class="sec-head col">
+        <p class="eyebrow">Install</p>
+        <h2 id="install-h">Starts in dry run. It reports and never blocks until you say so.</h2>
+        <p>Watch a kernel update or two, confirm the output matches what you know about the machine, then set <code>DRY_RUN=0</code> in <code>/etc/updateguard.conf</code>.</p>
+      </div>
+      <div class="installs">
+        <div class="install">
+          <h3>Arch &amp; CachyOS</h3>
+          <div class="code">
+            <button class="copy" type="button" data-copy="code-arch">Copy</button>
+<pre id="code-arch">git clone https://github.com/zkm/updateguard.git
+cd updateguard
+makepkg -si
+sudo updateguard doctor</pre>
+          </div>
+        </div>
+        <div class="install">
+          <h3>Debian &amp; Ubuntu <span class="note">(preview)</span></h3>
+          <div class="code">
+            <button class="copy" type="button" data-copy="code-apt">Copy</button>
+<pre id="code-apt">git clone https://github.com/zkm/updateguard.git
+cd updateguard
+sudo ./install.sh --apply
+sudo updateguard doctor</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section aria-labelledby="road-h">
+      <div class="sec-head col">
+        <p class="eyebrow">Roadmap</p>
+        <h2 id="road-h">What comes next.</h2>
+      </div>
+      <ol class="roadmap col">
+        <li><div><b>Debian &amp; Ubuntu on real machines.</b> <span>Testing on 22.04, 24.04 and Debian 12, a .deb package, and rollback for ext4 servers with LVM snapshots.</span></div></li>
+        <li><div><b>RHEL family.</b> <span>dnf, dracut and BLS support for Rocky, Alma and Fedora.</span></div></li>
+        <li><div><b>Fleet reporting.</b> <span><code>updateguard check --json</code> from every machine to one dashboard, with an alert when a server shouldn't be rebooted.</span></div></li>
+        <li><div><b>Automatic rollback.</b> <span>Once the checks have proven themselves on real updates.</span></div></li>
+      </ol>
+    </section>
+  </main>
+
+  <footer>
+    <span>updateguard 0.1.1 · MIT License · © 2026 Zach Schneider</span>
+    <span class="mono">https://github.com/zkm/updateguard.git</span>
+  </footer>
+</div>
+
+<script>
+(function () {
+  var tabs = [document.getElementById('tab-arch'), document.getElementById('tab-apt')];
+  function select(tab) {
+    tabs.forEach(function (t) {
+      var on = t === tab;
+      t.setAttribute('aria-selected', on ? 'true' : 'false');
+      t.tabIndex = on ? 0 : -1;
+      document.getElementById(t.getAttribute('aria-controls')).hidden = !on;
+    });
+  }
+  tabs.forEach(function (t, i) {
+    t.addEventListener('click', function () { select(t); });
+    t.addEventListener('keydown', function (e) {
+      if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+        var n = tabs[(i + (e.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length];
+        select(n); n.focus();
+      }
+    });
+  });
+
+  document.querySelectorAll('.copy').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var pre = document.getElementById(btn.dataset.copy);
+      var text = pre.textContent;
+      function done(label) { btn.textContent = label; setTimeout(function () { btn.textContent = 'Copy'; }, 1600); }
+      function selectIt() {
+        var r = document.createRange(); r.selectNodeContents(pre);
+        var s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
+        done('Selected');
+      }
+      try {
+        navigator.clipboard.writeText(text).then(function () { done('Copied'); }, selectIt);
+      } catch (e) { selectIt(); }
+    });
+  });
+})();
+</script>
+</body>
+</html>
