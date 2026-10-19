@@ -1,0 +1,8 @@
+// updateguard apt hooks (Debian, Ubuntu and derivatives).
+// Pre-Install-Pkgs runs before dpkg and gets the package list on stdin; a non-zero
+// exit aborts apt. Post-Invoke runs after dpkg and its triggers (update-initramfs,
+// update-grub, DKMS) have finished, and never fails the apt run.
+// The first word of the Pre-Install-Pkgs command must match the Tools::Options key.
+DPkg::Pre-Install-Pkgs { "/usr/bin/updateguard hook-pre --apt"; };
+DPkg::Tools::Options::/usr/bin/updateguard::Version "2";
+DPkg::Post-Invoke { "if [ -x /usr/bin/updateguard ]; then /usr/bin/updateguard hook-post --apt </dev/null || true; fi"; };

@@ -1,0 +1,1199 @@
+#!/usr/bin/env bash
+# updateguard — snapshot before risky package updates, verify boot health after.
+# Copyright (c) 2026 Zach Schneider. SPDX-License-Identifier: MIT
+#
+# Runs from package manager hooks (hook-pre / hook-post) and as a CLI. See `updateguard help`.
+# Backends: arch (pacman + mkinitcpio) and debian (apt/dpkg + initramfs-tools, incl. Ubuntu).
+
+set -uo pipefail
+shopt -s nullglob extglob
+
+readonly VERSION=0.1.1
+readonly R="${UG_ROOT:-}"                  # test harness only; empty on real systems
+readonly CONF="${UG_CONF:-$R/etc/updateguard.conf}"
+readonly STATE_DIR="$R/var/lib/updateguard"
+readonly RUN_DIR="${UG_RUN_DIR:-$R/run/updateguard}"
+readonly ESP_CANDIDATES=(/boot/efi /boot /efi)   # most specific first
+
+# ---------------------------------------------------------------- defaults --
+# Every one of these can be overridden in /etc/updateguard.conf.
+DRY_RUN=1                       # 1 = check and report only; 0 = take snapshots/backups
+FAMILY=auto                     # auto | arch | debian (from /etc/os-release)
+BACKEND=auto                    # auto | snapper | btrfs | none
+SNAPSHOT_DIR=/.updateguard-snapshots
+KEEP=5                          # raw btrfs snapshots + boot backups to keep
+BOOT_BACKUP=1                   # copy kernel/initramfs off the boot partition before updates
+BOOT_BACKUP_FALLBACK=0          # include *-fallback images (large)
+MAX_BOOT_BACKUP_MB=1024
+ABORT_ON_UNMOUNTED_BOOT=1       # stop pacman if /boot is in fstab but not mounted
+ABORT_ON_SNAPSHOT_FAIL=0
+ESP_MIN_FREE_MB=64
+CHECK_INITRAMFS_CONTENTS=1      # use lsinitcpio to confirm the image matches the kernel
+EXCLUDE=(linux-api-headers linux-docs 'linux-*-docs' linux-firmware-whence)
+DEFAULT_TARGETS=(linux 'linux-*' '*-dkms' dkms nvidia 'nvidia-*' mkinitcpio 'mkinitcpio-*'
+  dracut booster systemd grub limine 'limine-*' refind glibc amd-ucode intel-ucode
+  btrfs-progs cryptsetup lvm2 kmod)
+DEBIAN_TARGETS=('linux-image-*' 'linux-modules-*' 'linux-headers-*' 'linux-signed-*' 'linux-generic*'
+  'linux-firmware*' '*-dkms' dkms 'nvidia-*' 'initramfs-tools*' 'dracut*' 'grub-*' 'grub2*' 'shim*'
+  systemd 'systemd-boot*' libc6 amd64-microcode intel-microcode btrfs-progs 'cryptsetup*' lvm2 kmod 'zfs*')
+
+if [[ -r $CONF ]]; then
+  # shellcheck source=/dev/null
+  source "$CONF"
+fi
+
+os_release_get() {   # KEY -> value from os-release, quotes stripped
+  local f
+  for f in "$R/etc/os-release" "$R/usr/lib/os-release"; do
+    [[ -r $f ]] || continue
+    sed -n "s/^$1=//p" "$f" | head -n1 | tr -d "\"'"
+    return 0
+  done
+  return 1
+}
+
+detect_family() {
+  local ids
+  ids=" $(os_release_get ID) $(os_release_get ID_LIKE) "
+  case $ids in
+    *" arch "*) printf arch ;;
+    *" debian "* | *" ubuntu "*) printf debian ;;
+    *) if [[ -d $R/var/lib/dpkg/info && ! -d $R/var/lib/pacman ]]; then printf debian; else printf arch; fi ;;
+  esac
+}
+
+[[ $FAMILY == arch || $FAMILY == debian ]] || FAMILY=$(detect_family)
+# merged-/usr systems (Arch, Ubuntu 19.04+, Debian 12+) keep modules in /usr/lib/modules
+MODROOT=/usr/lib/modules
+[[ -d $R$MODROOT || ! -d $R/lib/modules ]] || MODROOT=/lib/modules
+
+# ------------------------------------------------------------------ output --
+QUIET=0
+FAILS=0
+WARNS=0
+REPORT=()       # "LEVEL<TAB>check-id<TAB>message<TAB>fix"
+TARGETS=()
+RISKY=()
+PATTERNS=()
+KERNELS=()      # "kver<TAB>pkgbase"
+LOADERS=()      # human-readable bootloader descriptions
+ENTRY_PATHS=()  # "loader<TAB>title<TAB>root-hint<TAB>path"
+UKIS=()         # unprefixed paths of unified kernel images
+
+out() { [[ $QUIET == 1 ]] || printf '%s\n' "$*"; }
+
+emit() {
+  local level=$1 id=$2 msg=${3//$'\t'/ } fix=${4:-}
+  fix=${fix//$'\t'/ }
+  case $level in
+    FAIL) FAILS=$((FAILS + 1)) ;;
+    WARN) WARNS=$((WARNS + 1)) ;;
+  esac
+  REPORT+=("$level"$'\t'"$id"$'\t'"$msg"$'\t'"$fix")
+  [[ $QUIET == 1 ]] && return 0
+  printf '  [%-4s] %s\n' "$level" "$msg"
+  if [[ -n $fix && $level != OK ]]; then printf '         fix: %s\n' "$fix"; fi
+}
+
+json_str() {
+  local s=$1
+  s=${s//\\/\\\\}; s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}; s=${s//$'\t'/\\t}; s=${s//$'\r'/\\r}
+  printf '"%s"' "$s"
+}
+
+row() { printf '  %-20s %s\n' "$1:" "$2"; }
+
+# ------------------------------------------------------------ environment --
+root_fstype() { findmnt -no FSTYPE "$R/" 2>/dev/null | head -n1; }
+root_source() { findmnt -no SOURCE "$R/" 2>/dev/null | head -n1; }   # e.g. /dev/sda2[/@]
+root_uuid()   { findmnt -no UUID "$R/" 2>/dev/null | head -n1; }
+root_device() { local s; s=$(root_source); printf '%s' "${s%%\[*}"; }
+root_subvol() {
+  local s; s=$(root_source)
+  if [[ $s == *\[*\] ]]; then s=${s#*\[}; printf '%s' "${s%\]}"; fi
+}
+mount_uuid() { findmnt -no UUID --mountpoint "$R$1" 2>/dev/null | head -n1; }
+
+fstab_has() {
+  [[ -r $R/etc/fstab ]] || return 1
+  awk -v mp="$1" '$1 !~ /^#/ && $2 == mp { f = 1 } END { exit !f }' "$R/etc/fstab"
+}
+fstab_root_pins_subvolid() {
+  [[ -r $R/etc/fstab ]] || return 1
+  awk '$1 !~ /^#/ && $2 == "/" && $4 ~ /subvolid=/ { f = 1 } END { exit !f }' "$R/etc/fstab"
+}
+
+is_mounted() {
+  local mp=$1 t
+  ls "$R$mp" >/dev/null 2>&1   # wakes systemd automounts
+  while read -r t; do
+    [[ -n $t && $t != autofs ]] && return 0
+  done < <(findmnt -rn -o FSTYPE --mountpoint "$R$mp" 2>/dev/null)
+  return 1
+}
+
+free_mb() { df -Pm "$1" 2>/dev/null | awk 'NR == 2 { print $4 }'; }
+
+separate_boot_mounts() {   # prints boot-ish mountpoints that are their own fstab entries
+  local mp
+  for mp in "${ESP_CANDIDATES[@]}"; do fstab_has "$mp" && printf '%s\n' "$mp"; done
+}
+
+snapper_root_ok() {
+  command -v snapper >/dev/null 2>&1 && snapper --no-dbus -c root get-config >/dev/null 2>&1
+}
+snap_pac_present() {
+  local f
+  for f in "$R"/usr/share/libalpm/hooks/*snap-pac-pre.hook "$R"/etc/pacman.d/hooks/*snap-pac-pre.hook; do
+    [[ -f $f ]] && return 0
+  done
+  return 1
+}
+snapshot_boot_tool() {   # can the bootloader boot into snapshots?
+  if [[ -x $R/usr/bin/limine-snapper-sync ]]; then printf 'limine-snapper-sync'
+  elif [[ -e $R/etc/grub.d/41_snapshots-btrfs ]]; then printf 'grub-btrfs'
+  fi
+}
+
+pick_backend() {
+  case $BACKEND in
+    auto)
+      if snapper_root_ok; then
+        if snap_pac_present; then printf 'snap-pac'; else printf 'snapper'; fi
+      elif [[ $(root_fstype) == btrfs ]] && command -v btrfs >/dev/null 2>&1; then
+        printf 'btrfs'
+      else
+        printf 'none'
+      fi ;;
+    snapper | btrfs | none) printf '%s' "$BACKEND" ;;
+    *) printf 'none' ;;
+  esac
+}
+
+# ---------------------------------------------------------------- targets --
+find_hook_file() {
+  local f
+  for f in "${UG_HOOK_FILE:-}" "$R/etc/pacman.d/hooks/05-updateguard-pre.hook" \
+           "$R/usr/share/libalpm/hooks/05-updateguard-pre.hook"; do
+    [[ -n $f && -r $f ]] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
+
+load_patterns() {   # arch: the pre hook's Target lines are the single source of truth
+  local f line re='^[[:space:]]*Target[[:space:]]*=[[:space:]]*([^[:space:]]+)'
+  PATTERNS=()
+  if [[ $FAMILY == debian ]]; then
+    PATTERNS=("${DEBIAN_TARGETS[@]}")
+    return 0
+  fi
+  if f=$(find_hook_file); then
+    while IFS= read -r line; do
+      [[ $line =~ $re ]] && PATTERNS+=("${BASH_REMATCH[1]}")
+    done <"$f"
+  fi
+  (( ${#PATTERNS[@]} )) || PATTERNS=("${DEFAULT_TARGETS[@]}")
+}
+
+is_risky() {
+  local pkg=$1 pat
+  for pat in "${EXCLUDE[@]}"; do
+    # shellcheck disable=SC2053  # glob match is intended
+    [[ $pkg == $pat ]] && return 1
+  done
+  for pat in "${PATTERNS[@]}"; do
+    [[ $pat == '!'* ]] && continue
+    # shellcheck disable=SC2053
+    [[ $pkg == $pat ]] && return 0
+  done
+  return 1
+}
+
+read_targets() {   # [--apt]
+  TARGETS=()
+  [[ -t 0 ]] && return 0
+  if [[ ${1:-} == --apt ]]; then read_apt_targets; else mapfile -t TARGETS; fi
+}
+
+# apt's DPkg::Pre-Install-Pkgs stdin. VERSION 1: one .deb path per line.
+# VERSION 2/3: a header, a blank line, then one line per package starting with its name.
+read_apt_targets() {
+  local line t first=1 hdr=0 v2=0
+  while IFS= read -r line || [[ -n $line ]]; do
+    if (( first )); then
+      first=0
+      if [[ $line == 'VERSION '* ]]; then hdr=1; v2=1; continue; fi
+    fi
+    if (( hdr )); then [[ -z $line ]] && hdr=0; continue; fi
+    [[ -n $line ]] || continue
+    if (( v2 )); then t=${line%% *}; else t=${line##*/}; t=${t%%_*}; fi
+    TARGETS+=("${t%%:*}")
+  done
+}
+
+filter_risky() {
+  local t
+  RISKY=()
+  for t in "${TARGETS[@]}"; do
+    [[ -n $t ]] && is_risky "$t" && RISKY+=("$t")
+  done
+}
+
+# ---------------------------------------------------------------- kernels --
+load_kernels() {   # KERNELS+=("kver<TAB>package"): pkgbase on Arch, linux-image-<kver> on Debian
+  local d pb kver
+  KERNELS=()
+  for d in "$R$MODROOT"/*/; do
+    d=${d%/}; kver=${d##*/}
+    if [[ $FAMILY == debian ]]; then
+      # removed kernels often leave a modules dir behind (DKMS builds), so ask dpkg
+      for pb in "linux-image-$kver" "linux-image-unsigned-$kver"; do
+        dpkg_installed "$pb" && { KERNELS+=("$kver"$'\t'"$pb"); break; }
+      done
+      continue
+    fi
+    [[ -f $d/pkgbase ]] || continue
+    pb=$(<"$d/pkgbase"); pb=${pb//[[:space:]]/}
+    KERNELS+=("$kver"$'\t'"$pb")
+  done
+}
+
+# --------------------------------------------------------- family helpers --
+dpkg_installed() {   # PKG -> rc 0 if dpkg status says "install ok installed"
+  awk -v p="$1" '/^Package: / { cur = $2 } cur == p && /^Status: / { s = $0 }
+    END { exit !(s ~ / installed$/) }' "$R/var/lib/dpkg/status" 2>/dev/null
+}
+
+dpkg_md5() {   # PKG RELPATH -> md5 dpkg recorded for that file
+  awk -v p="$2" '$2 == p { print $1; exit }' "$R/var/lib/dpkg/info/$1.md5sums" 2>/dev/null
+}
+
+fix_reinstall() {   # PKG
+  if [[ $FAMILY == debian ]]; then printf 'sudo apt install --reinstall %s' "$1"
+  else printf 'sudo pacman -S %s' "$1"; fi
+}
+
+fix_initramfs() {   # PKG KVER [create]
+  if [[ $FAMILY == debian ]]; then
+    printf 'sudo update-initramfs -%s -k %s' "$([[ ${3:-} == create ]] && echo c || echo u)" "$2"
+  else
+    printf 'sudo mkinitcpio -p %s' "$1"
+  fi
+}
+
+fix_headers() {   # PKG KVER
+  if [[ $FAMILY == debian ]]; then printf 'sudo apt install linux-headers-%s' "$2"
+  else printf 'sudo pacman -S %s-headers' "$1"; fi
+  printf ' && sudo dkms autoinstall -k %s' "$2"
+}
+
+initramfs_list() {   # IMAGE -> file listing; rc 1 if there's no tool or it can't read the image
+  if [[ $FAMILY == debian ]]; then
+    command -v lsinitramfs >/dev/null 2>&1 && lsinitramfs "$1" 2>/dev/null
+  else
+    command -v lsinitcpio >/dev/null 2>&1 && lsinitcpio -l "$1" 2>/dev/null
+  fi
+}
+
+preset_file() { printf '%s' "$R/etc/mkinitcpio.d/$1.preset"; }
+
+preset_get() {   # FILE KEY -> value of KEY= (literal values only)
+  local line val
+  line=$(grep -E "^[[:space:]]*$2=" "$1" 2>/dev/null | tail -n1)
+  [[ -n $line ]] || return 1
+  val=${line#*=}
+  val=${val%%+([[:space:]])#*}
+  val=${val//[\"\']/}
+  val=${val##+([[:space:]])}; val=${val%%+([[:space:]])}
+  [[ -n $val && $val != *'$'* ]] || return 1
+  printf '%s' "$val"
+}
+
+preset_active() {   # FILE NAME -> is NAME listed in PRESETS=( ... )?
+  local line re
+  line=$(grep -E '^[[:space:]]*PRESETS=' "$1" 2>/dev/null | tail -n1)
+  [[ -z $line ]] && return 0
+  re="[( '\"]$2['\" )]"
+  [[ $line =~ $re ]]
+}
+
+pkg_install_time() {   # PKG -> epoch seconds from the package manager's local db
+  local d
+  if [[ $FAMILY == debian ]]; then   # dpkg rewrites the file list when it unpacks the package
+    stat -c %Y "$R/var/lib/dpkg/info/$1.list" 2>/dev/null
+    return
+  fi
+  for d in "$R"/var/lib/pacman/local/"$1"-[0-9]*/; do
+    [[ -f $d/desc ]] || continue
+    [[ $(sed -n '/^%NAME%$/{n;p;q}' "$d/desc") == "$1" ]] || continue
+    sed -n '/^%INSTALLDATE%$/{n;p;q}' "$d/desc"
+    return 0
+  done
+  return 1
+}
+
+uki_section() {   # UKI SECTION OUTFILE
+  objcopy -O binary --only-section="$2" "$1" "$3" 2>/dev/null && [[ -s $3 ]]
+}
+
+same_prefix() {   # EXTRACTED ORIGINAL: PE sections may be zero-padded to file alignment
+  local n; n=$(stat -c %s "$2")
+  (( $(stat -c %s "$1") >= n )) || return 1
+  cmp -s -n "$n" "$1" "$2" || return 1
+  [[ -z $(tail -c +"$((n + 1))" "$1" | tr -d '\0' | head -c1) ]]
+}
+
+check_uki() {   # PKGBASE KVER IMAGE -> rc 0 verified, 1 failed (reported), 2 can't inspect
+  local pb=$1 kver=$2 img=$3 tmp listing rc=0
+  command -v objcopy >/dev/null 2>&1 || return 2
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/updateguard.XXXXXX") || return 2
+  if ! uki_section "$R$img" .linux "$tmp/linux"; then
+    rm -rf "$tmp"; return 2
+  fi
+  if ! same_prefix "$tmp/linux" "$R/usr/lib/modules/$kver/vmlinuz"; then
+    emit FAIL initramfs "$pb: $img contains a different kernel than installed $kver" "sudo mkinitcpio -p $pb"
+    rc=1
+  elif [[ $CHECK_INITRAMFS_CONTENTS == 1 ]] && uki_section "$R$img" .initrd "$tmp/initrd" &&
+       listing=$(initramfs_list "$tmp/initrd"); then
+    if [[ $listing != *"lib/modules/$kver/"* && $listing == *lib/modules/* ]]; then
+      emit FAIL initramfs "$pb: $img has the right kernel but its initramfs was built for a different one" "sudo mkinitcpio -p $pb"
+      rc=1
+    fi
+  fi
+  rm -rf "$tmp"
+  (( rc )) && return 1
+  emit OK initramfs "$pb: $img contains installed kernel $kver"
+  return 0
+}
+
+check_image() {   # PKGBASE KVER IMAGE REFTIME KIND
+  local pb=$1 kver=$2 img=$3 ctime=$4 kind=$5 f="$R$3" mtime listing
+  if [[ ! -s $f ]]; then
+    emit FAIL initramfs "$pb: $img is missing or empty" "$(fix_initramfs "$pb" "$kver" create)"
+    return
+  fi
+  if [[ $kind == uki ]]; then
+    check_uki "$pb" "$kver" "$img"
+    (( $? == 2 )) || return   # verified by content; fall back to timestamps only if we couldn't look inside
+  fi
+  mtime=$(stat -c %Y "$f")
+  if (( mtime < ctime )); then
+    emit FAIL initramfs "$pb: $img is older than the installed kernel $kver (it was not regenerated)" \
+      "$(fix_initramfs "$pb" "$kver")"
+    return
+  fi
+  if [[ $kind == image && $CHECK_INITRAMFS_CONTENTS == 1 ]] && listing=$(initramfs_list "$f"); then
+    if [[ $listing != *"lib/modules/$kver/"* && $listing == *lib/modules/* ]]; then
+      emit FAIL initramfs "$pb: $img was built for a different kernel than $kver" "$(fix_initramfs "$pb" "$kver")"
+      return
+    fi
+  fi
+  emit OK initramfs "$pb: $img is current"
+}
+
+check_kernel_debian() {   # KVER PKG: /boot/vmlinuz-<kver> + /boot/initrd.img-<kver>
+  local kver=$1 pkg=$2 k="/boot/vmlinuz-$1" i="/boot/initrd.img-$1" want ref
+  if [[ ! -s $R$k ]]; then
+    emit FAIL kernel-image "$pkg: $k is missing" "Mount /boot if it's a separate partition, then: $(fix_reinstall "$pkg")"
+  elif [[ ! -r $R$k ]]; then   # Ubuntu installs vmlinuz mode 0600
+    emit WARN permissions "$pkg: can't read $k as this user; kernel check skipped" "sudo updateguard check"
+  elif want=$(dpkg_md5 "$pkg" "${k#/}") && [[ -n $want ]]; then
+    if [[ $(md5sum <"$R$k" | cut -d' ' -f1) == "$want" ]]; then
+      emit OK kernel-image "$pkg: $k matches the packaged kernel"
+    else
+      emit FAIL kernel-image "$pkg: $k doesn't match what $pkg installed; the bootloader would load a different kernel than the modules on disk" \
+        "Make sure /boot is mounted, then: $(fix_reinstall "$pkg")"
+    fi
+  else
+    emit OK kernel-image "$pkg: $k is present (dpkg has no checksum to compare)"
+  fi
+  ref=$(pkg_install_time "$pkg") || ref=""
+  [[ $ref =~ ^[0-9]+$ ]] || ref=0
+  check_image "$pkg" "$kver" "$i" "$((ref - 2))" image
+}
+
+check_kernel() {   # KVER PKGBASE
+  local kver=$1 pb=$2 moddir="$R$MODROOT/$1" pf kimg ctime p key img
+  if [[ $FAMILY == debian ]]; then check_kernel_debian "$@"; return; fi
+  if [[ ! -f $moddir/vmlinuz ]]; then
+    emit FAIL kernel-files "$pb $kver: /usr/lib/modules/$kver/vmlinuz is missing (package damaged?)" \
+      "sudo pacman -S $pb"
+    return
+  fi
+  # pacman's recorded install time; the file's ctime is the fallback (any chmod/xattr/dedupe bumps it)
+  ctime=$(pkg_install_time "$pb") || ctime=""
+  [[ $ctime =~ ^[0-9]+$ ]] || ctime=$(stat -c %Z "$moddir/vmlinuz")
+  ctime=$((ctime - 2))   # FAT stores mtimes with 2-second granularity
+  pf=$(preset_file "$pb")
+  if [[ -f $pf ]] && kimg=$(preset_get "$pf" ALL_kver) && [[ -d $R${kimg%/*} && ! ( -r $R${kimg%/*} && -x $R${kimg%/*} ) ]]; then
+    emit WARN permissions "$pb: can't read ${kimg%/*} as this user; image checks skipped" "sudo updateguard check"
+    return
+  fi
+  if [[ ! -f $pf ]]; then
+    if [[ -d $R/etc/mkinitcpio.d ]]; then
+      emit WARN preset "$pb: no mkinitcpio preset at /etc/mkinitcpio.d/$pb.preset; /boot image checks skipped"
+    else
+      emit INFO preset "$pb: mkinitcpio not in use; /boot image checks skipped (dracut/booster support is TODO)"
+    fi
+    return
+  fi
+  if kimg=$(preset_get "$pf" ALL_kver); then
+    if [[ ! -f $R$kimg ]]; then
+      emit FAIL kernel-image "$pb: $kimg is missing" "Mount ${kimg%/*} if it's a separate partition, then: sudo pacman -S $pb"
+    elif ! cmp -s "$R$kimg" "$moddir/vmlinuz"; then
+      emit FAIL kernel-image "$pb: $kimg doesn't match installed kernel $kver; the bootloader would load a stale kernel against new modules" \
+        "Make sure ${kimg%/*} is mounted, then: sudo pacman -S $pb"
+    else
+      emit OK kernel-image "$pb: $kimg matches installed kernel $kver"
+    fi
+  fi
+  for p in default fallback; do
+    preset_active "$pf" "$p" || continue
+    for key in image uki; do
+      img=$(preset_get "$pf" "${p}_$key") || continue
+      check_image "$pb" "$kver" "$img" "$ctime" "$key"
+    done
+  done
+}
+
+# ------------------------------------------------------------------- dkms --
+check_dkms() {
+  command -v dkms >/dev/null 2>&1 || return 0
+  local line mod kver state status k pb missing m
+  local re_new='^([^/,]+)/([^,]+), ([^,]+), ([^:]+): (.*)$'
+  local re_old='^([^,]+), ([^,]+), ([^,]+), ([^:]+): (.*)$'
+  local re_added_new='^([^/,]+)/([^,:]+): (.*)$'
+  local re_added_old='^([^,]+), ([^,:]+): (.*)$'
+  local -A MODS=() INST=()
+  status=$(dkms status 2>/dev/null) || status=""
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    if [[ $line =~ $re_new || $line =~ $re_old ]]; then
+      mod=${BASH_REMATCH[1]}; kver=${BASH_REMATCH[3]}; state=${BASH_REMATCH[5]}
+      MODS[$mod]=1
+      [[ $state == installed* ]] && INST["$mod|$kver"]=1
+    elif [[ $line =~ $re_added_new || $line =~ $re_added_old ]]; then
+      MODS[${BASH_REMATCH[1]}]=1
+    fi
+  done <<<"$status"
+  (( ${#MODS[@]} )) || return 0
+  for k in "${KERNELS[@]}"; do
+    IFS=$'\t' read -r kver pb <<<"$k"
+    if [[ ! -e $R$MODROOT/$kver/build ]]; then
+      emit FAIL dkms-headers "$pb $kver has no headers, so DKMS modules ($(printf '%s ' "${!MODS[@]}" | sed 's/ $//')) can't build for it" \
+        "$(fix_headers "$pb" "$kver")"
+      continue
+    fi
+    missing=()
+    for m in "${!MODS[@]}"; do
+      [[ -n ${INST["$m|$kver"]:-} ]] || missing+=("$m")
+    done
+    if (( ${#missing[@]} )); then
+      emit FAIL dkms "$pb $kver: DKMS module(s) not installed: ${missing[*]}" "sudo dkms autoinstall -k $kver"
+    else
+      emit OK dkms "$pb $kver: DKMS modules installed (${!MODS[*]})"
+    fi
+  done
+}
+
+# ------------------------------------------------------------- bootloader --
+strip_loader_prefix() {
+  local p=$1 re_fn='^[a-z]+\([^)]*\):(.*)$' re_uri='^boot://[0-9]*/(.*)$'
+  if [[ $p =~ $re_fn ]]; then p=${BASH_REMATCH[1]}
+  elif [[ $p =~ $re_uri ]]; then p=/${BASH_REMATCH[1]}
+  fi
+  [[ $p == /* ]] || p=/$p
+  printf '%s' "$p"
+}
+
+resolve_path() {   # HINT PATH -> unprefixed existing path; rc 1 = missing, 2 = unresolvable
+  local hint=$1 p c re='^/@[^/]*(/.*)$'
+  p=$(strip_loader_prefix "$2")
+  [[ $p == *'$'* ]] && return 2
+  if [[ -n $hint && -f $R$hint$p ]]; then printf '%s' "$hint$p"; return 0; fi
+  for c in "${ESP_CANDIDATES[@]}" ""; do
+    [[ -f $R$c$p ]] && { printf '%s' "$c$p"; return 0; }
+  done
+  if [[ $p =~ $re && -f $R${BASH_REMATCH[1]} ]]; then printf '%s' "${BASH_REMATCH[1]}"; return 0; fi
+  return 1
+}
+
+collect_boot_entries() {
+  local c f key val title name n line cfg esp parts p sd
+  local re_menu="^[[:space:]]*menuentry[[:space:]]+['\"]([^'\"]+)"
+  local re_glinux='^[[:space:]]*(linux|linuxefi|linux16)[[:space:]]+([^[:space:]]+)'
+  local re_ginitrd='^[[:space:]]*(initrd|initrdefi|initrd16)[[:space:]]+(.+)$'
+  local re_lpath='^(kernel_path|module_path|KERNEL_PATH|MODULE_PATH)[[:space:]]*[:=][[:space:]]*([^[:space:]]+)'
+  LOADERS=(); ENTRY_PATHS=(); UKIS=()
+
+  # systemd-boot / Boot Loader Spec entries
+  for c in "${ESP_CANDIDATES[@]}"; do
+    [[ -d $R$c/loader/entries ]] || continue
+    name=BLS
+    sd=("$R$c"/EFI/systemd/systemd-boot*.efi)
+    (( ${#sd[@]} )) && name=systemd-boot
+    n=0
+    for f in "$R$c"/loader/entries/*.conf; do
+      n=$((n + 1)); title=${f##*/}
+      while read -r key val; do
+        case $key in
+          title) title=$val ;;
+          linux | initrd | efi) [[ -n $val ]] && ENTRY_PATHS+=("$name"$'\t'"$title"$'\t'"$c"$'\t'"$val") ;;
+        esac
+      done <"$f"
+    done
+    LOADERS+=("$name ($c/loader/entries, $n entries)")
+    break
+  done
+
+  # GRUB
+  f="$R/boot/grub/grub.cfg"
+  if [[ -f $f ]]; then
+    title=""; n=0
+    while IFS= read -r line; do
+      if [[ $line =~ $re_menu ]]; then
+        title=${BASH_REMATCH[1]}; n=$((n + 1))
+      elif [[ $line =~ $re_glinux ]]; then
+        ENTRY_PATHS+=("GRUB"$'\t'"$title"$'\t'""$'\t'"${BASH_REMATCH[2]}")
+      elif [[ $line =~ $re_ginitrd ]]; then
+        read -ra parts <<<"${BASH_REMATCH[2]}"
+        for p in "${parts[@]}"; do ENTRY_PATHS+=("GRUB"$'\t'"$title"$'\t'""$'\t'"$p"); done
+      fi
+    done <"$f"
+    LOADERS+=("GRUB (/boot/grub/grub.cfg, $n entries)")
+  fi
+
+  # Limine (v8+ limine.conf, older limine.cfg)
+  for cfg in /boot/limine.conf /boot/limine/limine.conf /boot/EFI/limine/limine.conf /boot/EFI/BOOT/limine.conf \
+             /efi/limine.conf /efi/limine/limine.conf /efi/EFI/limine/limine.conf /efi/EFI/BOOT/limine.conf \
+             /boot/efi/limine.conf /boot/efi/EFI/limine/limine.conf /boot/efi/EFI/BOOT/limine.conf \
+             /boot/limine.cfg /efi/limine.cfg /boot/efi/limine.cfg; do
+    [[ -f $R$cfg ]] || continue
+    esp=""
+    for c in "${ESP_CANDIDATES[@]}"; do [[ $cfg == "$c"/* ]] && { esp=$c; break; }; done
+    title=""; n=0
+    while IFS= read -r line; do
+      line=${line##+([[:space:]])}
+      if [[ $line == /* ]]; then title=${line##+(/)}; n=$((n + 1))
+      elif [[ $line == :* ]]; then title=${line#:}; n=$((n + 1))
+      elif [[ $line =~ $re_lpath ]]; then
+        ENTRY_PATHS+=("Limine"$'\t'"$title"$'\t'"$esp"$'\t'"${BASH_REMATCH[2]}")
+      fi
+    done <"$R$cfg"
+    LOADERS+=("Limine ($cfg, $n entries)")
+    break
+  done
+
+  # Unified kernel images, auto-detected by systemd-boot
+  for c in "${ESP_CANDIDATES[@]}"; do
+    n=0
+    for f in "$R$c"/EFI/Linux/*.efi; do UKIS+=("${f#"$R"}"); n=$((n + 1)); done
+    (( n )) && LOADERS+=("UKIs ($c/EFI/Linux, $n images)")
+  done
+  return 0
+}
+
+best_pkgbase_match() {   # NAME -> installed pkgbase that NAME most specifically refers to
+  local name=$1 k kver pb best="" re
+  for k in "${KERNELS[@]}"; do
+    IFS=$'\t' read -r kver pb <<<"$k"
+    re="(^|[-_/])${pb//+/\\+}([-_.]|$)"
+    if [[ $name =~ $re ]] && (( ${#pb} > ${#best} )); then best=$pb; fi
+  done
+  printf '%s' "$best"
+}
+
+check_boot_entries() {
+  collect_boot_entries
+  if (( ${#LOADERS[@]} == 0 )); then
+    emit WARN bootloader "No bootloader config found (looked for systemd-boot/BLS, GRUB, Limine, UKIs)" \
+      "If your ESP isn't world-readable, run: sudo updateguard check"
+    return
+  fi
+  local e loader title hint path res rc base k kver pb key u n=0
+  local -A SEEN=() EXPECT=() COVERED=()
+  for k in "${KERNELS[@]}"; do
+    IFS=$'\t' read -r kver pb <<<"$k"
+    if [[ $FAMILY == debian ]]; then EXPECT["vmlinuz-$kver"]=$pb; EXPECT["initrd.img-$kver"]=$pb
+    else EXPECT["vmlinuz-$pb"]=$pb; EXPECT["initramfs-$pb.img"]=$pb; fi
+  done
+  for e in "${ENTRY_PATHS[@]}"; do
+    # split by hand: `read` would collapse the empty hint field of GRUB entries
+    loader=${e%%$'\t'*}; e=${e#*$'\t'}; title=${e%%$'\t'*}; e=${e#*$'\t'}; hint=${e%%$'\t'*}; path=${e#*$'\t'}
+    n=$((n + 1))
+    res=$(resolve_path "$hint" "$path"); rc=$?
+    base=${path##*/}
+    if (( rc == 0 )); then
+      for k in "${KERNELS[@]}"; do
+        IFS=$'\t' read -r kver pb <<<"$k"
+        if [[ $base == "vmlinuz-$pb" || $base == "vmlinuz-$kver" || $res == */"$kver"/* ]]; then COVERED[$pb]=1; fi
+      done
+      pb=$(best_pkgbase_match "$res"); [[ -n $pb && $base == vmlinuz* ]] && COVERED[$pb]=1
+    elif (( rc == 1 )); then
+      key="$loader|$path"
+      [[ -n ${SEEN[$key]:-} ]] && continue
+      SEEN[$key]=1
+      if [[ -n ${EXPECT[$base]:-} ]]; then
+        emit FAIL boot-entry "$loader entry \"$title\" points to $path, which doesn't exist (kernel ${EXPECT[$base]} is installed)" \
+          "$(regen_hint "$loader")"
+      else
+        emit WARN boot-entry "$loader entry \"$title\" points to $path, which doesn't exist (stale entry?)" \
+          "$(regen_hint "$loader")"
+      fi
+    fi
+  done
+  for u in "${UKIS[@]}"; do
+    pb=$(best_pkgbase_match "${u##*/}")
+    [[ -n $pb ]] && COVERED[$pb]=1
+  done
+  for k in "${KERNELS[@]}"; do
+    IFS=$'\t' read -r kver pb <<<"$k"
+    if [[ -z ${COVERED[$pb]:-} ]]; then
+      emit WARN boot-entry "No boot entry found for $pb ($kver)" "$(regen_hint "${LOADERS[0]%% *}")"
+    fi
+  done
+  emit OK bootloader "Boot config parsed: ${LOADERS[*]} — $n file references checked"
+}
+
+regen_hint() {
+  case $1 in
+    GRUB) if [[ $FAMILY == debian ]]; then printf 'sudo update-grub'; else printf 'sudo grub-mkconfig -o /boot/grub/grub.cfg'; fi ;;
+    Limine) printf 'Regenerate entries (CachyOS: sudo limine-update) or fix limine.conf' ;;
+    systemd-boot | BLS) printf 'Add or fix the entry in loader/entries/*.conf on your ESP' ;;
+    *) printf 'Regenerate your bootloader configuration' ;;
+  esac
+}
+
+check_boot_mounts() {
+  local mp rc=0 any=0 free
+  for mp in "${ESP_CANDIDATES[@]}"; do
+    fstab_has "$mp" || continue
+    any=1
+    if is_mounted "$mp"; then
+      free=$(free_mb "$R$mp")
+      if [[ -n $free && $free -lt $ESP_MIN_FREE_MB ]]; then
+        emit WARN boot-space "$mp is mounted but only ${free} MB free; a full $mp truncates initramfs writes" \
+          "Remove unused kernels or fallback images from $mp"
+      else
+        emit OK boot-mount "$mp is mounted${free:+ (${free} MB free)}"
+      fi
+    else
+      emit FAIL boot-mount "$mp is in /etc/fstab but NOT mounted; kernel/bootloader files would land on the root filesystem instead" \
+        "sudo mount $mp, then reinstall your kernel(s): $(fix_reinstall '<kernel package>')"
+      rc=1
+    fi
+  done
+  (( any )) || emit OK boot-mount "/boot lives on the root filesystem (no separate boot partition in fstab)"
+  return $rc
+}
+
+check_running_kernel() {
+  local r
+  (( ${#KERNELS[@]} )) || return 0
+  r=$(uname -r)
+  if [[ ! -d $R$MODROOT/$r ]]; then
+    emit INFO reboot "Running kernel $r was replaced on disk; reboot soon (new modules can't load until you do)"
+  fi
+}
+
+run_checks() {
+  local k kver pb
+  FAILS=0; WARNS=0; REPORT=()
+  load_kernels
+  check_boot_mounts || true
+  (( ${#KERNELS[@]} )) || emit WARN kernels "No installed kernels found under $MODROOT"
+  for k in "${KERNELS[@]}"; do
+    IFS=$'\t' read -r kver pb <<<"$k"
+    check_kernel "$kver" "$pb"
+  done
+  check_dkms
+  check_boot_entries
+  check_running_kernel
+}
+
+report_json() {   # ID
+  local e level cid msg fix first=1
+  printf '{"tool":"updateguard","version":%s,"id":%s,"host":%s,"time":%s,"dry_run":%s,"fails":%d,"warns":%d,"checks":[' \
+    "$(json_str "$VERSION")" "$(json_str "$1")" "$(json_str "$(uname -n)")" "$(json_str "$(date -Is)")" \
+    "$([[ $DRY_RUN == 1 ]] && printf true || printf false)" "$FAILS" "$WARNS"
+  for e in "${REPORT[@]}"; do
+    level=${e%%$'\t'*}; e=${e#*$'\t'}; cid=${e%%$'\t'*}; e=${e#*$'\t'}; msg=${e%%$'\t'*}; fix=${e#*$'\t'}
+    (( first )) || printf ','
+    first=0
+    printf '{"level":%s,"check":%s,"message":%s,"fix":%s}' \
+      "$(json_str "$level")" "$(json_str "$cid")" "$(json_str "$msg")" "$(json_str "$fix")"
+  done
+  printf ']}\n'
+}
+
+# ------------------------------------------------------------------ state --
+new_id() { printf '%s' "${UG_NOW:-$(date +%Y%m%d-%H%M%S)}"; }
+txn_dir() { printf '%s' "$STATE_DIR/txn/$1"; }
+meta_set() { [[ ${NO_STATE:-0} == 1 ]] || printf '%s=%s\n' "$2" "$3" >>"$(txn_dir "$1")/meta"; }
+meta_get() {
+  local f; f="$(txn_dir "$1")/meta"
+  [[ -f $f ]] || return 1
+  grep -E "^$2=" "$f" | tail -n1 | cut -d= -f2-
+}
+history_add() {
+  [[ ${NO_STATE:-0} == 1 ]] && return 0
+  mkdir -p "$STATE_DIR"
+  printf '%s\t%s\t%s\t%s\n' "$(date -Is)" "$1" "$2" "$3" >>"$STATE_DIR/history.tsv"
+}
+log_journal() { command -v logger >/dev/null 2>&1 && logger -t updateguard -p "$1" -- "$2"; return 0; }
+
+# ---------------------------------------------------------- boot backups --
+boot_files() {   # unprefixed paths of kernel/initramfs/microcode/UKI files worth protecting
+  local k kver pb pf v p key c f
+  for k in "${KERNELS[@]}"; do
+    IFS=$'\t' read -r kver pb <<<"$k"
+    if [[ $FAMILY == debian ]]; then
+      printf '%s\n' "/boot/vmlinuz-$kver" "/boot/initrd.img-$kver" "/boot/config-$kver" "/boot/System.map-$kver"
+      continue
+    fi
+    pf=$(preset_file "$pb")
+    [[ -f $pf ]] || continue
+    v=$(preset_get "$pf" ALL_kver) && printf '%s\n' "$v"
+    for p in default fallback; do
+      [[ $p == fallback && $BOOT_BACKUP_FALLBACK != 1 ]] && continue
+      preset_active "$pf" "$p" || continue
+      for key in image uki; do v=$(preset_get "$pf" "${p}_$key") && printf '%s\n' "$v"; done
+    done
+  done
+  for f in "$R"/boot/*ucode*.img; do printf '%s\n' "${f#"$R"}"; done
+  for c in "${ESP_CANDIDATES[@]}"; do
+    for f in "$R$c"/EFI/Linux/*.efi; do printf '%s\n' "${f#"$R"}"; done
+  done
+}
+
+backup_boot() {   # ID
+  local id=$1 dest="$STATE_DIR/boot/$1" f bytes=0 mb avail list=() keep=() seps
+  seps=$(separate_boot_mounts)
+  # Debian keeps kernels in /boot even when the ESP is mounted at /boot/efi
+  [[ $FAMILY == debian ]] && ! fstab_has /boot && seps=""
+  if [[ -z $seps ]]; then
+    emit INFO boot-backup "Kernel and initramfs live on the root filesystem, so the snapshot already covers them"
+    return 0
+  fi
+  mapfile -t list < <(boot_files | sort -u)
+  for f in "${list[@]}"; do
+    [[ -f $R$f ]] || continue
+    keep+=("$f"); bytes=$((bytes + $(stat -c %s "$R$f")))
+  done
+  if (( ${#keep[@]} == 0 )); then
+    emit WARN boot-backup "Found no kernel/initramfs files to back up from the boot partition"
+    return 0
+  fi
+  mb=$(( (bytes + 1048575) / 1048576 ))
+  if (( mb > MAX_BOOT_BACKUP_MB )); then
+    emit WARN boot-backup "Boot files total ${mb} MB (> MAX_BOOT_BACKUP_MB=${MAX_BOOT_BACKUP_MB}); skipped backup"
+    return 0
+  fi
+  if [[ $DRY_RUN == 1 ]]; then
+    emit INFO boot-backup "[dry run] would copy ${#keep[@]} boot files (${mb} MB) to ${dest#"$R"}"
+    return 0
+  fi
+  mkdir -p "$dest" || { emit WARN boot-backup "Couldn't create ${dest#"$R"}"; return 0; }
+  avail=$(free_mb "$dest")
+  if [[ -n $avail ]] && (( avail < mb + 256 )); then
+    emit WARN boot-backup "Only ${avail} MB free for a ${mb} MB boot backup; skipped"
+    rmdir "$dest" 2>/dev/null
+    return 0
+  fi
+  for f in "${keep[@]}"; do
+    if ! { mkdir -p "$dest${f%/*}" && cp -a "$R$f" "$dest$f"; }; then
+      emit WARN boot-backup "Failed copying $f; boot backup incomplete"
+      return 0
+    fi
+  done
+  meta_set "$id" boot_backup "${dest#"$R"}"
+  emit OK boot-backup "Copied ${#keep[@]} boot files (${mb} MB) to ${dest#"$R"}"
+}
+
+# --------------------------------------------------------------- snapshot --
+snapshot_btrfs() {   # ID -> unprefixed snapshot path
+  local dir="$R$SNAPSHOT_DIR"
+  mkdir -p "$dir" || return 1
+  btrfs subvolume snapshot -r "$R/" "$dir/$1" >/dev/null || return 1
+  printf '%s' "$SNAPSHOT_DIR/$1"
+}
+
+snapshot_snapper() {
+  local desc="updateguard pre: ${RISKY[*]}"
+  snapper --no-dbus -c root create --type single --cleanup-algorithm number --print-number \
+    --description "${desc:0:120}" --userdata "important=yes"
+}
+
+snapper_latest() {
+  snapper --no-dbus -c root --machine-readable csv list --columns number 2>/dev/null | tail -n1
+}
+
+# -------------------------------------------------------------- pre hook --
+pre_flow() {   # returns 1 only when the transaction should be aborted
+  local id backend ref="" uuid mp tag=""
+  [[ $DRY_RUN == 1 ]] && tag=" [dry run]"
+  id=$(new_id)
+  out "==> updateguard ${VERSION}${tag}: ${#RISKY[@]} risky package(s): ${RISKY[*]}"
+  if [[ ${NO_STATE:-0} != 1 ]]; then
+    mkdir -p "$(txn_dir "$id")" "$RUN_DIR"
+    printf '%s\n' "$id" >"$RUN_DIR/pending"
+  fi
+  meta_set "$id" packages "${RISKY[*]}"
+  meta_set "$id" dry_run "$DRY_RUN"
+
+  if ! check_boot_mounts; then
+    if [[ $DRY_RUN != 1 && $ABORT_ON_UNMOUNTED_BOOT == 1 ]]; then
+      out "==> updateguard: ABORTING. Mount the boot partition, then run $([[ $FAMILY == debian ]] && echo apt || echo pacman) again."
+      meta_set "$id" result aborted-unmounted-boot
+      history_add "$id" ABORTED "boot partition not mounted"
+      rm -f "$RUN_DIR/pending"
+      return 1
+    fi
+    [[ $DRY_RUN == 1 ]] && emit INFO boot-mount "[dry run] with DRY_RUN=0 this transaction would be aborted here"
+  fi
+
+  backend=$(pick_backend)
+  meta_set "$id" backend "$backend"
+  meta_set "$id" root_device "$(root_device)"
+  meta_set "$id" root_uuid "$(root_uuid)"
+  meta_set "$id" root_subvol "$(root_subvol)"
+  meta_set "$id" snapshot_boot "$(snapshot_boot_tool)"
+  fstab_root_pins_subvolid && meta_set "$id" fstab_subvolid 1
+  while read -r mp; do
+    [[ -n $mp ]] || continue
+    uuid=$(mount_uuid "$mp")
+    meta_set "$id" "mount_$mp" "$uuid"
+  done < <(separate_boot_mounts)
+
+  case $backend in
+    none)
+      emit WARN snapshot "No snapshot backend (root is $(root_fstype), not btrfs); checks still run, but there's nothing to roll back to" ;;
+    snap-pac)
+      ref=$(snapper_latest)
+      emit OK snapshot "snap-pac took the pre-update snapshot (snapper #${ref:-?})" ;;
+    snapper | btrfs)
+      if [[ $DRY_RUN == 1 ]]; then
+        emit INFO snapshot "[dry run] would take a $backend snapshot of /"
+      elif { [[ $backend == snapper ]] && ref=$(snapshot_snapper); } ||
+           { [[ $backend == btrfs ]] && ref=$(snapshot_btrfs "$id"); }; then
+        emit OK snapshot "Took $backend snapshot: $ref"
+      else
+        emit WARN snapshot "$backend snapshot FAILED"
+        if [[ $ABORT_ON_SNAPSHOT_FAIL == 1 ]]; then
+          out "==> updateguard: ABORTING (ABORT_ON_SNAPSHOT_FAIL=1)."
+          meta_set "$id" result aborted-snapshot-failed
+          history_add "$id" ABORTED "snapshot failed"
+          rm -f "$RUN_DIR/pending"
+          return 1
+        fi
+      fi ;;
+  esac
+  meta_set "$id" snapshot_ref "$ref"
+
+  if [[ $backend != none && $BOOT_BACKUP == 1 ]]; then
+    load_kernels
+    backup_boot "$id"
+  fi
+  return 0
+}
+
+cmd_hook_pre() {   # [--apt]
+  read_targets "$@"; load_patterns; filter_risky
+  (( ${#RISKY[@]} )) || exit 0
+  pre_flow || exit 1
+  exit 0
+}
+
+# ------------------------------------------------------------- post hook --
+post_flow() {   # ID ; returns 1 on FAIL
+  local id=$1 backend
+  out "==> updateguard: verifying boot health"
+  run_checks
+  if [[ ${NO_STATE:-0} != 1 ]]; then
+    mkdir -p "$(txn_dir "$id")"
+    printf '%s\n' "${REPORT[@]}" >"$(txn_dir "$id")/report.tsv"
+    report_json "$id" >"$(txn_dir "$id")/report.json"
+    meta_set "$id" fails "$FAILS"
+    meta_set "$id" warns "$WARNS"
+  fi
+  backend=$(meta_get "$id" backend 2>/dev/null || true)
+  if (( FAILS )); then
+    out "==> updateguard: $FAILS problem(s) found. Do NOT reboot until they're fixed (see the fix: lines)."
+    if [[ -n $backend && $backend != none && $DRY_RUN != 1 ]]; then
+      out "    Pre-update snapshot exists. Last resort: updateguard rollback-help $id"
+    fi
+    meta_set "$id" result FAIL
+    history_add "$id" FAIL "$FAILS fail, $WARNS warn"
+    log_journal user.err "transaction $id: $FAILS boot-health failure(s); see /var/lib/updateguard/txn/$id/report.tsv"
+    return 1
+  fi
+  out "==> updateguard: boot looks healthy ($WARNS warning(s))"
+  meta_set "$id" result OK
+  history_add "$id" OK "$WARNS warn"
+  log_journal user.info "transaction $id: boot health OK ($WARNS warning(s))"
+  [[ $DRY_RUN != 1 ]] && QUIET=1 cmd_prune
+  return 0
+}
+
+cmd_hook_post() {   # [--apt]: DPkg::Post-Invoke gets no package list; relies on the pending id from hook-pre
+  local pend="" id age
+  [[ ${1:-} == --apt ]] || read_targets
+  load_patterns; filter_risky
+  if [[ -r $RUN_DIR/pending ]]; then
+    age=$(( $(date +%s) - $(stat -c %Y "$RUN_DIR/pending") ))
+    (( age < 21600 )) && pend=$(<"$RUN_DIR/pending")
+  fi
+  (( ${#RISKY[@]} )) || [[ -n $pend ]] || exit 0
+  id=${pend:-$(new_id)}
+  mkdir -p "$(txn_dir "$id")"
+  post_flow "$id"; local rc=$?
+  rm -f "$RUN_DIR/pending"
+  exit $rc
+}
+
+# ------------------------------------------------------------------- CLI --
+cmd_check() {
+  local json=0
+  [[ ${1:-} == --json ]] && json=1
+  if (( json )); then
+    QUIET=1 run_checks
+    QUIET=1
+    report_json manual
+  else
+    printf 'updateguard %s — boot health check\n' "$VERSION"
+    run_checks
+    printf '\n%d failure(s), %d warning(s)\n' "$FAILS" "$WARNS"
+  fi
+  (( FAILS == 0 ))
+}
+
+cmd_simulate() {
+  (( $# )) || { echo "usage: updateguard simulate PKG..." >&2; exit 2; }
+  local t
+  TARGETS=("$@"); load_patterns; filter_risky
+  for t in "${TARGETS[@]}"; do
+    if is_risky "$t"; then printf '  risky   %s\n' "$t"; else printf '  ignored %s\n' "$t"; fi
+  done
+  if (( ${#RISKY[@]} == 0 )); then
+    echo "Nothing risky; the hooks would stay silent for this transaction."
+    return 0
+  fi
+  echo
+  DRY_RUN=1 NO_STATE=1 pre_flow
+}
+
+cmd_doctor() {
+  local k kver pb pf mods backend sb hooks="" mp ac="$R/etc/apt/apt.conf.d/05updateguard"
+  load_kernels; collect_boot_entries
+  backend=$(pick_backend); sb=$(snapshot_boot_tool)
+  printf 'updateguard %s — environment\n\n' "$VERSION"
+  if [[ $DRY_RUN == 1 ]]; then
+    row "Mode" "DRY RUN: checks only. Set DRY_RUN=0 in /etc/updateguard.conf to take snapshots"
+  else
+    row "Mode" "active"
+  fi
+  row "Distro" "$(os_release_get PRETTY_NAME || echo unknown) ($FAMILY backend)"
+  if [[ $FAMILY == debian ]]; then
+    if [[ -f $ac ]]; then
+      grep -q 'Pre-Install-Pkgs' "$ac" && hooks="pre"
+      grep -q 'Post-Invoke' "$ac" && hooks="${hooks:+$hooks + }post"
+    fi
+    row "apt hooks" "${hooks:-NOT installed (run: sudo ./install.sh --apply)}"
+  else
+    find_hook_file >/dev/null && hooks="pre"
+    [[ -f $R/usr/share/libalpm/hooks/zzz-updateguard-post.hook || -f $R/etc/pacman.d/hooks/zzz-updateguard-post.hook ]] && hooks="${hooks:+$hooks + }post"
+    row "pacman hooks" "${hooks:-NOT installed (run install.sh --apply or makepkg -si)}"
+  fi
+  row "Root filesystem" "$(root_fstype) on $(root_source)"
+  case $backend in
+    snap-pac) row "Snapshots" "snapper config 'root' + snap-pac (snap-pac takes them; updateguard records them)" ;;
+    snapper) row "Snapshots" "snapper config 'root' (updateguard creates them)" ;;
+    btrfs) row "Snapshots" "raw btrfs, read-only, in $SNAPSHOT_DIR (keeps $KEEP)" ;;
+    none) row "Snapshots" "none available (root isn't btrfs); verification only" ;;
+  esac
+  row "Boot into snapshot" "${sb:-not set up (rollback needs a live USB)}"
+  while read -r mp; do
+    [[ -n $mp ]] || continue
+    if is_mounted "$mp"; then row "Boot mount" "$mp mounted, $(free_mb "$R$mp") MB free"
+    else row "Boot mount" "$mp NOT mounted"; fi
+  done < <(separate_boot_mounts)
+  [[ -z $(separate_boot_mounts) ]] && row "Boot mount" "/boot is on the root filesystem"
+  if (( ${#LOADERS[@]} )); then
+    for k in "${LOADERS[@]}"; do row "Bootloader" "$k"; done
+  else
+    row "Bootloader" "not detected"
+  fi
+  for k in "${KERNELS[@]}"; do
+    IFS=$'\t' read -r kver pb <<<"$k"
+    if [[ $FAMILY == debian ]]; then
+      pf="no initrd"; [[ -e $R/boot/initrd.img-$kver ]] && pf="initrd"
+    else
+      pf="no preset"; [[ -f $(preset_file "$pb") ]] && pf="preset ok"
+    fi
+    [[ -e $R$MODROOT/$kver/build ]] && pf="$pf, headers" || pf="$pf, no headers"
+    row "Kernel" "$pb $kver ($pf)"
+  done
+  if command -v dkms >/dev/null 2>&1; then
+    mods=$(dkms status 2>/dev/null | sed -E 's/[,:].*//' | sort -u | paste -sd' ' -)
+    row "DKMS" "${mods:-no modules}"
+  fi
+  if fstab_root_pins_subvolid; then
+    printf '\n  note: /etc/fstab pins / by subvolid=. A restored snapshot gets a new subvolume ID, so\n'
+    printf '        remove subvolid= from the / line (keep subvol=) before you ever need a rollback.\n'
+  fi
+  printf '\nHealth check:\n'
+  run_checks
+  printf '\n%d failure(s), %d warning(s)\n' "$FAILS" "$WARNS"
+}
+
+cmd_status() {
+  local ts id result detail
+  printf 'updateguard %s  mode=%s  backend=%s\n' "$VERSION" \
+    "$([[ $DRY_RUN == 1 ]] && echo dry-run || echo active)" "$(pick_backend)"
+  if [[ ! -s $STATE_DIR/history.tsv ]]; then
+    echo "No transactions recorded yet."
+    return 0
+  fi
+  printf '\n%-20s %-16s %-8s %s\n' TIME ID RESULT DETAIL
+  tail -n 15 "$STATE_DIR/history.tsv" | while IFS=$'\t' read -r ts id result detail; do
+    printf '%-20s %-16s %-8s %s\n' "${ts:0:19}" "$id" "$result" "$detail"
+  done
+}
+
+latest_snapshot_txn() {
+  local d id
+  for d in $(printf '%s\n' "$STATE_DIR"/txn/*/ | sort -r); do
+    id=${d%/}; id=${id##*/}
+    [[ -n $(meta_get "$id" snapshot_ref 2>/dev/null) ]] && { printf '%s' "$id"; return 0; }
+  done
+  return 1
+}
+
+cmd_rollback_help() {
+  local id=${1:-} backend ref uuid subvol sv bootbk sb mp muuid key
+  if [[ -z $id ]]; then
+    id=$(latest_snapshot_txn) || { echo "No transaction with a snapshot recorded yet."; return 1; }
+  fi
+  [[ -d $(txn_dir "$id") ]] || { echo "Unknown transaction: $id (see: updateguard status)"; return 1; }
+  backend=$(meta_get "$id" backend); ref=$(meta_get "$id" snapshot_ref)
+  uuid=$(meta_get "$id" root_uuid); subvol=$(meta_get "$id" root_subvol)
+  bootbk=$(meta_get "$id" boot_backup); sb=$(meta_get "$id" snapshot_boot)
+  sv=${subvol#/}
+  printf 'Rollback for transaction %s (packages: %s)\n\n' "$id" "$(meta_get "$id" packages)"
+  echo "First try the targeted fixes from 'sudo updateguard check'. Most update breakage"
+  echo "(missing headers, stale initramfs, unmounted /boot) is fixed without rolling back."
+  echo
+  case $backend in
+    none | "") echo "No snapshot was taken for this transaction, so there's nothing to roll back to."; return 0 ;;
+    btrfs)
+      if [[ -z $ref ]]; then echo "The snapshot for this transaction wasn't created (dry run or failure)."; return 0; fi
+      if [[ -z $sv ]]; then
+        echo "Root is the btrfs top-level subvolume, so a rename-based rollback isn't possible."
+        echo "Copy what you need back from the read-only snapshot at $ref."
+        return 0
+      fi
+      echo "Raw btrfs snapshot: $ref (root subvolume /$sv, filesystem UUID $uuid)"
+      echo
+      echo "Boot a live USB (or any system where this root isn't mounted), then:"
+      echo
+      echo "  mount -o subvolid=5 UUID=$uuid /mnt"
+      echo "  mv /mnt/$sv /mnt/$sv.broken-$id"
+      echo "  btrfs subvolume snapshot /mnt/$sv.broken-$id$ref /mnt/$sv"
+      if [[ $(meta_get "$id" fstab_subvolid) == 1 ]]; then
+        echo "  # the new subvolume has a new ID; drop subvolid= from the / line:"
+        echo "  sed -i -E '/[[:space:]]\\/[[:space:]]/ s/,?subvolid=[0-9]+//' /mnt/$sv/etc/fstab"
+      fi
+      ;;
+    snapper | snap-pac)
+      echo "snapper snapshot #${ref:-?} (config root)"
+      echo
+      if [[ -n $sb ]]; then
+        echo "  1. Reboot and pick snapshot #$ref from the boot menu ($sb)."
+        echo "  2. Once booted into it: sudo snapper rollback $ref && reboot"
+      else
+        echo "  If the system still boots:  sudo snapper -c root undochange $ref..0"
+        echo "  If it doesn't: boot a live USB and follow your layout's snapper rollback steps;"
+        echo "  installing limine-snapper-sync or grub-btrfs makes this a boot-menu choice next time."
+      fi
+      ;;
+  esac
+  if [[ -n $bootbk ]]; then
+    echo
+    echo "Then put the pre-update kernel/initramfs back on the boot partition:"
+    while IFS= read -r key; do
+      mp=${key#mount_}; mp=${mp%%=*}; muuid=${key#*=}
+      [[ -n $muuid ]] || continue
+      echo "  mkdir -p /mnt-boot && mount UUID=$muuid /mnt-boot"
+      if [[ $backend == btrfs ]]; then
+        echo "  cp -a /mnt/$sv$bootbk$mp/. /mnt-boot/"
+      else
+        echo "  cp -a <restored root>$bootbk$mp/. /mnt-boot/"
+      fi
+      echo "  umount /mnt-boot"
+    done < <(grep -E '^mount_' "$(txn_dir "$id")/meta")
+  fi
+  echo
+  echo "Reboot, then run: sudo updateguard check"
+}
+
+cmd_prune() {
+  local d name snaps=() backups=() txns=() i n
+  for d in "$R$SNAPSHOT_DIR"/*; do
+    name=${d##*/}
+    [[ $name =~ ^[0-9]{8}-[0-9]{6}$ ]] && snaps+=("$d")
+  done
+  n=${#snaps[@]}
+  for (( i = 0; i < n - KEEP; i++ )); do
+    if [[ $DRY_RUN == 1 ]]; then out "[dry run] would delete snapshot ${snaps[i]#"$R"}"
+    else btrfs subvolume delete "${snaps[i]}" >/dev/null && out "deleted snapshot ${snaps[i]#"$R"}"; fi
+  done
+  for d in "$STATE_DIR"/boot/*/; do backups+=("${d%/}"); done
+  n=${#backups[@]}
+  for (( i = 0; i < n - KEEP; i++ )); do
+    if [[ $DRY_RUN == 1 ]]; then out "[dry run] would delete boot backup ${backups[i]#"$R"}"
+    else rm -rf -- "${backups[i]}" && out "deleted boot backup ${backups[i]#"$R"}"; fi
+  done
+  for d in "$STATE_DIR"/txn/*/; do txns+=("${d%/}"); done
+  n=${#txns[@]}
+  for (( i = 0; i < n - 50; i++ )); do [[ $DRY_RUN == 1 ]] || rm -rf -- "${txns[i]}"; done
+  return 0
+}
+
+usage() {
+  cat <<EOF
+updateguard $VERSION — snapshot before risky package updates, verify boot health after
+
+Usage: updateguard COMMAND
+
+  doctor              Show what updateguard detects on this machine, then run a check
+  check [--json]      Verify kernels, initramfs, DKMS modules, boot mounts and boot entries
+  simulate PKG...     Show what the hooks would do if PKG... were upgraded (always a dry run)
+  status              Recent transactions and their results
+  rollback-help [ID]  Exact rollback steps for a transaction (default: latest with a snapshot)
+  prune               Delete old snapshots/boot backups beyond KEEP=$KEEP
+  version             Print version
+
+Config: /etc/updateguard.conf   State: /var/lib/updateguard
+EOF
+}
+
+main() {
+  local cmd=${1:-help}
+  (( $# )) && shift
+  case $cmd in
+    hook-pre) cmd_hook_pre "$@" ;;
+    hook-post) cmd_hook_post "$@" ;;
+    doctor) cmd_doctor ;;
+    check) cmd_check "$@" ;;
+    simulate) cmd_simulate "$@" ;;
+    status) cmd_status ;;
+    rollback-help) cmd_rollback_help "$@" ;;
+    prune) cmd_prune ;;
+    version | --version | -V) printf 'updateguard %s\n' "$VERSION" ;;
+    help | -h | --help) usage ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"

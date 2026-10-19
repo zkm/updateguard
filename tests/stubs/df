@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+printf 'Filesystem 1048576-blocks Used Available Capacity Mounted\n/dev/x 512 100 %s 20%% %s\n' "${T_DF_AVAIL:-400}" "${!#}"

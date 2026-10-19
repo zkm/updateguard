@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+[[ ${T_SNAPPER:-0} == 1 ]] || exit 1
+case "$*" in
+  *get-config*) echo "SUBVOLUME | /" ;;
+  *create*) echo "$*" >>"$UG_ROOT/snapper.log"; echo 42 ;;
+  *list*) printf 'number\n0\n41\n' ;;
+esac
