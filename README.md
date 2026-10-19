@@ -1,7 +1,7 @@
 # updateguard
 
 Snapshot before risky OS updates, then verify the machine will still boot
-before you reboot. v0.1.1: Arch and CachyOS (pacman), plus Debian and Ubuntu
+before you reboot. v0.2.0: Arch and CachyOS (pacman), plus Debian and Ubuntu
 (apt) in preview. (Name is a placeholder; check the AUR and GitHub before
 publishing.)
 
