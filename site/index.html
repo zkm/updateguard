@@ -89,7 +89,8 @@ p { margin: 0; }
 .sig { color: var(--term-signal); font-weight: 600; }
 .cursor { display: inline-block; width: 0.6em; height: 1.1em; vertical-align: -0.2em; background: var(--term-fg); animation: blink 1.1s steps(1) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
-@media (prefers-reduced-motion: reduce) { .cursor { animation: none; } }
+html { scroll-behavior: smooth; scroll-padding-top: 24px; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } .cursor { animation: none; } }
 
 section { padding-block: 56px; border-top: 1px solid var(--line); }
 .sec-head { display: grid; gap: 12px; margin-bottom: 32px; }
