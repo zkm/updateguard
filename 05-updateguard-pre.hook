@@ -1,0 +1,37 @@
+# updateguard: runs before transactions that touch the kernel, drivers, initramfs
+# tooling, bootloader or core libraries. These Target lines are also what
+# `updateguard simulate` uses, so edit them here only.
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = linux
+Target = linux-*
+Target = *-dkms
+Target = dkms
+Target = nvidia
+Target = nvidia-*
+Target = mkinitcpio
+Target = mkinitcpio-*
+Target = dracut
+Target = booster
+Target = systemd
+Target = grub
+Target = limine
+Target = limine-*
+Target = refind
+Target = glibc
+Target = amd-ucode
+Target = intel-ucode
+Target = btrfs-progs
+Target = cryptsetup
+Target = lvm2
+Target = kmod
+
+[Action]
+Description = updateguard: snapshot and boot-partition check...
+When = PreTransaction
+Exec = /usr/bin/updateguard hook-pre
+NeedsTargets
+AbortOnFail
