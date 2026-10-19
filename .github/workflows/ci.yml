@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # gcc and objcopy (binutils) let the UKI section of the suite run instead of skipping
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y shellcheck gcc binutils
+
+      - name: ShellCheck
+        run: shellcheck updateguard tests/run-tests.sh install.sh
+
+      - name: Tests
+        run: bash tests/run-tests.sh
+
+      - name: Version strings agree
+        run: |
+          v=$(sed -n 's/^readonly VERSION=//p' updateguard)
+          grep -q "^pkgver=$v$" PKGBUILD
+          grep -q "updateguard $v" site/index.html
+          grep -q "v$v:" README.md

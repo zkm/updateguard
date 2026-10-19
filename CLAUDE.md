@@ -39,4 +39,4 @@ There is no per-test selector: the suite is one script of numbered sections (`ec
 - Ubuntu installs `/boot/vmlinuz-*` mode 0600; unreadable files must produce a `permissions` WARN pointing at `sudo updateguard check`, not a FAIL.
 - The apt pre hook command's first word must match the `DPkg::Tools::Options::<path>::Version "2"` key in `apt/05updateguard`, and `install.sh` rewrites both paths together. A leftover apt hook pointing at a missing binary breaks apt, so uninstall removes the hook first.
 - Everything defaults to `DRY_RUN=1`: report only, never snapshot or abort. Destructive actions (snapshots, prune, aborting the transaction) are gated on `DRY_RUN=0`.
-- `site/` is the static landing page and icon; it isn't packaged.
+- `site/` is the static landing page and icon; it isn't packaged. `.github/workflows/pages.yml` deploys it to GitHub Pages on pushes to `master`; `ci.yml` runs shellcheck, the suite and a version-string consistency check. `master` is the primary branch.
