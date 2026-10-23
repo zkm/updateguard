@@ -2,3 +2,4 @@
 /src/
 /pkg/
 *.pkg.tar.*
+__pycache__/

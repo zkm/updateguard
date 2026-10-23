@@ -3,7 +3,8 @@
 # Copyright (c) 2026 Zach Schneider. SPDX-License-Identifier: MIT
 #
 # Runs from package manager hooks (hook-pre / hook-post) and as a CLI. See `updateguard help`.
-# Backends: arch (pacman + mkinitcpio) and debian (apt/dpkg + initramfs-tools, incl. Ubuntu).
+# Backends: arch (pacman + mkinitcpio), debian (apt/dpkg + initramfs-tools, incl. Ubuntu) and
+# rhel (dnf/rpm + dracut + kernel-install: Fedora, RHEL, Rocky, Alma, CentOS Stream).
 
 set -uo pipefail
 shopt -s nullglob extglob
@@ -15,10 +16,17 @@ readonly STATE_DIR="$R/var/lib/updateguard"
 readonly RUN_DIR="${UG_RUN_DIR:-$R/run/updateguard}"
 readonly ESP_CANDIDATES=(/boot/efi /boot /efi)   # most specific first
 
+# dnf5's actions plugin runs this once per package in the transaction, so it stays cheap:
+# record the name and exit before the rest of the script is even parsed.
+if [[ ${1:-} == hook-note ]]; then
+  mkdir -p "$RUN_DIR" && printf '%s\n' "${@:2}" >>"$RUN_DIR/dnf-targets"
+  exit 0
+fi
+
 # ---------------------------------------------------------------- defaults --
 # Every one of these can be overridden in /etc/updateguard.conf.
 DRY_RUN=1                       # 1 = check and report only; 0 = take snapshots/backups
-FAMILY=auto                     # auto | arch | debian (from /etc/os-release)
+FAMILY=auto                     # auto | arch | debian | rhel (from /etc/os-release)
 BACKEND=auto                    # auto | snapper | btrfs | none
 SNAPSHOT_DIR=/.updateguard-snapshots
 KEEP=5                          # raw btrfs snapshots + boot backups to keep
@@ -36,6 +44,15 @@ DEFAULT_TARGETS=(linux 'linux-*' '*-dkms' dkms nvidia 'nvidia-*' mkinitcpio 'mki
 DEBIAN_TARGETS=('linux-image-*' 'linux-modules-*' 'linux-headers-*' 'linux-signed-*' 'linux-generic*'
   'linux-firmware*' '*-dkms' dkms 'nvidia-*' 'initramfs-tools*' 'dracut*' 'grub-*' 'grub2*' 'shim*'
   systemd 'systemd-boot*' libc6 amd64-microcode intel-microcode btrfs-progs 'cryptsetup*' lvm2 kmod 'zfs*')
+# Fedora/RHEL: listed per flavour so kernel-headers, kernel-tools and kernel-srpm-macros don't match
+RHEL_TARGETS=(kernel kernel-core 'kernel-modules*' kernel-devel 'kernel-uki-*'
+  kernel-rt kernel-rt-core 'kernel-rt-modules*' kernel-rt-devel
+  kernel-debug kernel-debug-core 'kernel-debug-modules*' kernel-debug-devel
+  'kernel-64k*' kernel-ml kernel-ml-core 'kernel-ml-modules*' kernel-ml-devel
+  kernel-lt kernel-lt-core 'kernel-lt-modules*' kernel-lt-devel
+  'kmod-*' 'akmod-*' akmods '*-dkms' dkms 'nvidia-*' 'xorg-x11-drv-nvidia*' 'dracut*' 'grub2-*' grubby 'shim*'
+  systemd systemd-udev 'systemd-boot*' glibc 'linux-firmware*' microcode_ctl amd-ucode-firmware
+  btrfs-progs 'cryptsetup*' lvm2 kmod mdadm 'zfs*')
 
 if [[ -r $CONF ]]; then
   # shellcheck source=/dev/null
@@ -58,12 +75,15 @@ detect_family() {
   case $ids in
     *" arch "*) printf arch ;;
     *" debian "* | *" ubuntu "*) printf debian ;;
-    *) if [[ -d $R/var/lib/dpkg/info && ! -d $R/var/lib/pacman ]]; then printf debian; else printf arch; fi ;;
+    *" fedora "* | *" rhel "* | *" centos "*) printf rhel ;;
+    *) if [[ -d $R/var/lib/dpkg/info && ! -d $R/var/lib/pacman ]]; then printf debian
+       elif [[ -d $R/etc/dnf && ! -d $R/var/lib/pacman ]]; then printf rhel
+       else printf arch; fi ;;
   esac
 }
 
-[[ $FAMILY == arch || $FAMILY == debian ]] || FAMILY=$(detect_family)
-# merged-/usr systems (Arch, Ubuntu 19.04+, Debian 12+) keep modules in /usr/lib/modules
+[[ $FAMILY == arch || $FAMILY == debian || $FAMILY == rhel ]] || FAMILY=$(detect_family)
+# merged-/usr systems (Arch, Fedora, RHEL 8+, Ubuntu 19.04+, Debian 12+) keep modules in /usr/lib/modules
 MODROOT=/usr/lib/modules
 [[ -d $R$MODROOT || ! -d $R/lib/modules ]] || MODROOT=/lib/modules
 
@@ -79,6 +99,7 @@ KERNELS=()      # "kver<TAB>pkgbase"
 LOADERS=()      # human-readable bootloader descriptions
 ENTRY_PATHS=()  # "loader<TAB>title<TAB>root-hint<TAB>path"
 UKIS=()         # unprefixed paths of unified kernel images
+UNREADABLE_ENTRIES=""   # BLS entries dir we couldn't list (RHEL makes it 0700)
 
 out() { [[ $QUIET == 1 ]] || printf '%s\n' "$*"; }
 
@@ -184,10 +205,10 @@ find_hook_file() {
 load_patterns() {   # arch: the pre hook's Target lines are the single source of truth
   local f line re='^[[:space:]]*Target[[:space:]]*=[[:space:]]*([^[:space:]]+)'
   PATTERNS=()
-  if [[ $FAMILY == debian ]]; then
-    PATTERNS=("${DEBIAN_TARGETS[@]}")
-    return 0
-  fi
+  case $FAMILY in
+    debian) PATTERNS=("${DEBIAN_TARGETS[@]}"); return 0 ;;
+    rhel) PATTERNS=("${RHEL_TARGETS[@]}"); return 0 ;;
+  esac
   if f=$(find_hook_file); then
     while IFS= read -r line; do
       [[ $line =~ $re ]] && PATTERNS+=("${BASH_REMATCH[1]}")
@@ -210,8 +231,9 @@ is_risky() {
   return 1
 }
 
-read_targets() {   # [--apt]
+read_targets() {   # [--apt|--dnf5]
   TARGETS=()
+  [[ ${1:-} == --dnf5 ]] && { read_dnf5_targets; return 0; }
   [[ -t 0 ]] && return 0
   if [[ ${1:-} == --apt ]]; then read_apt_targets; else mapfile -t TARGETS; fi
 }
@@ -232,6 +254,14 @@ read_apt_targets() {
   done
 }
 
+# dnf5 can't pass the package list to one command; `hook-note` collected it in RUN_DIR
+read_dnf5_targets() {
+  local f="$RUN_DIR/dnf-targets"
+  [[ -f $f ]] || return 0
+  (( $(date +%s) - $(stat -c %Y "$f") < 21600 )) && mapfile -t TARGETS < <(sort -u "$f")
+  rm -f "$f"
+}
+
 filter_risky() {
   local t
   RISKY=()
@@ -241,11 +271,16 @@ filter_risky() {
 }
 
 # ---------------------------------------------------------------- kernels --
-load_kernels() {   # KERNELS+=("kver<TAB>package"): pkgbase on Arch, linux-image-<kver> on Debian
+load_kernels() {   # KERNELS+=("kver<TAB>package"): pkgbase on Arch, linux-image-<kver> on Debian, NVRA on RHEL
   local d pb kver
   KERNELS=()
   for d in "$R$MODROOT"/*/; do
     d=${d%/}; kver=${d##*/}
+    if [[ $FAMILY == rhel ]]; then
+      # removed kernels leave extra/ and weak-updates/ behind, so only count what rpm still owns
+      [[ -f $d/vmlinuz ]] && pb=$(rpm_owner "$d/vmlinuz") && KERNELS+=("$kver"$'\t'"$pb")
+      continue
+    fi
     if [[ $FAMILY == debian ]]; then
       # removed kernels often leave a modules dir behind (DKMS builds), so ask dpkg
       for pb in "linux-image-$kver" "linux-image-unsigned-$kver"; do
@@ -269,31 +304,55 @@ dpkg_md5() {   # PKG RELPATH -> md5 dpkg recorded for that file
   awk -v p="$2" '$2 == p { print $1; exit }' "$R/var/lib/dpkg/info/$1.md5sums" 2>/dev/null
 }
 
+rpm_owner() {   # FILE -> NVRA of the package that owns it (kernel-core-6.11.4-301.fc41.x86_64)
+  local o
+  command -v rpm >/dev/null 2>&1 || return 1
+  o=$(rpm -qf --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' "$1" 2>/dev/null) || return 1
+  printf '%s' "${o%%$'\n'*}"
+}
+
+rpm_devel_pkg() {   # kernel-rt-core-<vra> -> kernel-rt-devel-<vra>; version and release never contain '-'
+  local name=${1%-*-*}
+  printf '%s-devel-%s' "${name%-core}" "${1#"$name"-}"
+}
+
+pm_name() { case $FAMILY in debian) printf apt ;; rhel) printf dnf ;; *) printf pacman ;; esac; }
+
 fix_reinstall() {   # PKG
-  if [[ $FAMILY == debian ]]; then printf 'sudo apt install --reinstall %s' "$1"
-  else printf 'sudo pacman -S %s' "$1"; fi
+  case $FAMILY in
+    debian) printf 'sudo apt install --reinstall %s' "$1" ;;
+    rhel) printf 'sudo dnf reinstall %s' "$1" ;;
+    *) printf 'sudo pacman -S %s' "$1" ;;
+  esac
+}
+
+fix_kernel_install() {   # KVER: redoes what the kernel package's scriptlets do (copy, dracut, BLS entry)
+  printf 'sudo kernel-install add %s %s/%s/vmlinuz' "$1" "$MODROOT" "$1"
 }
 
 fix_initramfs() {   # PKG KVER [create]
-  if [[ $FAMILY == debian ]]; then
-    printf 'sudo update-initramfs -%s -k %s' "$([[ ${3:-} == create ]] && echo c || echo u)" "$2"
-  else
-    printf 'sudo mkinitcpio -p %s' "$1"
-  fi
+  case $FAMILY in
+    debian) printf 'sudo update-initramfs -%s -k %s' "$([[ ${3:-} == create ]] && echo c || echo u)" "$2" ;;
+    rhel) printf 'sudo dracut -f --kver %s' "$2" ;;
+    *) printf 'sudo mkinitcpio -p %s' "$1" ;;
+  esac
 }
 
 fix_headers() {   # PKG KVER
-  if [[ $FAMILY == debian ]]; then printf 'sudo apt install linux-headers-%s' "$2"
-  else printf 'sudo pacman -S %s-headers' "$1"; fi
+  case $FAMILY in
+    debian) printf 'sudo apt install linux-headers-%s' "$2" ;;
+    rhel) printf 'sudo dnf install %s' "$(rpm_devel_pkg "$1")" ;;
+    *) printf 'sudo pacman -S %s-headers' "$1" ;;
+  esac
   printf ' && sudo dkms autoinstall -k %s' "$2"
 }
 
 initramfs_list() {   # IMAGE -> file listing; rc 1 if there's no tool or it can't read the image
-  if [[ $FAMILY == debian ]]; then
-    command -v lsinitramfs >/dev/null 2>&1 && lsinitramfs "$1" 2>/dev/null
-  else
-    command -v lsinitcpio >/dev/null 2>&1 && lsinitcpio -l "$1" 2>/dev/null
-  fi
+  case $FAMILY in
+    debian) command -v lsinitramfs >/dev/null 2>&1 && lsinitramfs "$1" 2>/dev/null ;;
+    rhel) command -v lsinitrd >/dev/null 2>&1 && lsinitrd "$1" 2>/dev/null ;;
+    *) command -v lsinitcpio >/dev/null 2>&1 && lsinitcpio -l "$1" 2>/dev/null ;;
+  esac
 }
 
 preset_file() { printf '%s' "$R/etc/mkinitcpio.d/$1.preset"; }
@@ -322,6 +381,11 @@ pkg_install_time() {   # PKG -> epoch seconds from the package manager's local d
   local d
   if [[ $FAMILY == debian ]]; then   # dpkg rewrites the file list when it unpacks the package
     stat -c %Y "$R/var/lib/dpkg/info/$1.list" 2>/dev/null
+    return
+  fi
+  if [[ $FAMILY == rhel ]]; then   # one INSTALLTIME per transaction, before the posttrans dracut run
+    command -v rpm >/dev/null 2>&1 || return 1
+    rpm -q --qf '%{INSTALLTIME}\n' "$1" 2>/dev/null | head -n1
     return
   fi
   for d in "$R"/var/lib/pacman/local/"$1"-[0-9]*/; do
@@ -413,9 +477,30 @@ check_kernel_debian() {   # KVER PKG: /boot/vmlinuz-<kver> + /boot/initrd.img-<k
   check_image "$pkg" "$kver" "$i" "$((ref - 2))" image
 }
 
+check_kernel_rhel() {   # KVER PKG: kernel-install copies the kernel to /boot and dracut builds the initramfs
+  local kver=$1 pkg=$2 k="/boot/vmlinuz-$1" i="/boot/initramfs-$1.img" ref fix
+  fix=$(fix_kernel_install "$kver")
+  if [[ ! -s $R$k ]]; then
+    emit FAIL kernel-image "$pkg: $k is missing" "Mount /boot if it's a separate partition, then: $fix"
+  elif [[ ! -r $R$k ]]; then
+    emit WARN permissions "$pkg: can't read $k as this user; kernel check skipped" "sudo updateguard check"
+  elif ! cmp -s "$R$k" "$R$MODROOT/$kver/vmlinuz"; then
+    emit FAIL kernel-image "$pkg: $k doesn't match installed kernel $kver; the bootloader would load a stale kernel against new modules" \
+      "Make sure /boot is mounted, then: $fix"
+  else
+    emit OK kernel-image "$pkg: $k matches installed kernel $kver"
+  fi
+  ref=$(pkg_install_time "$pkg") || ref=""
+  [[ $ref =~ ^[0-9]+$ ]] || ref=$(stat -c %Z "$R$MODROOT/$kver/vmlinuz")
+  check_image "$pkg" "$kver" "$i" "$((ref - 2))" image
+}
+
 check_kernel() {   # KVER PKGBASE
   local kver=$1 pb=$2 moddir="$R$MODROOT/$1" pf kimg ctime p key img
-  if [[ $FAMILY == debian ]]; then check_kernel_debian "$@"; return; fi
+  case $FAMILY in
+    debian) check_kernel_debian "$@"; return ;;
+    rhel) check_kernel_rhel "$@"; return ;;
+  esac
   if [[ ! -f $moddir/vmlinuz ]]; then
     emit FAIL kernel-files "$pb $kver: /usr/lib/modules/$kver/vmlinuz is missing (package damaged?)" \
       "sudo pacman -S $pb"
@@ -497,6 +582,26 @@ check_dkms() {
   done
 }
 
+# akmods (RPM Fusion's NVIDIA and friends) builds kmod-<name>-<kver> RPMs instead of using DKMS.
+# It retries at boot, so a missing one is a warning: slow boot, or a black screen if that build fails too.
+check_akmods() {
+  [[ $FAMILY == rhel ]] && command -v rpm >/dev/null 2>&1 || return 0
+  local f m k kver pb names=() missing
+  for f in "$R"/usr/src/akmods/*-kmod.latest; do f=${f##*/}; names+=("${f%-kmod.latest}"); done
+  (( ${#names[@]} )) || return 0
+  for k in "${KERNELS[@]}"; do
+    IFS=$'\t' read -r kver pb <<<"$k"
+    missing=()
+    for m in "${names[@]}"; do rpm -q "kmod-$m-$kver" >/dev/null 2>&1 || missing+=("kmod-$m"); done
+    if (( ${#missing[@]} )); then
+      emit WARN akmods "$pb: ${missing[*]} not built for $kver yet; akmods retries at boot, and the driver is missing if that fails" \
+        "sudo akmods --force --kernels $kver"
+    else
+      emit OK akmods "$pb: akmods modules built (${names[*]})"
+    fi
+  done
+}
+
 # ------------------------------------------------------------- bootloader --
 strip_loader_prefix() {
   local p=$1 re_fn='^[a-z]+\([^)]*\):(.*)$' re_uri='^boot://[0-9]*/(.*)$'
@@ -525,21 +630,29 @@ collect_boot_entries() {
   local re_glinux='^[[:space:]]*(linux|linuxefi|linux16)[[:space:]]+([^[:space:]]+)'
   local re_ginitrd='^[[:space:]]*(initrd|initrdefi|initrd16)[[:space:]]+(.+)$'
   local re_lpath='^(kernel_path|module_path|KERNEL_PATH|MODULE_PATH)[[:space:]]*[:=][[:space:]]*([^[:space:]]+)'
-  LOADERS=(); ENTRY_PATHS=(); UKIS=()
+  LOADERS=(); ENTRY_PATHS=(); UKIS=(); UNREADABLE_ENTRIES=""
 
-  # systemd-boot / Boot Loader Spec entries
+  # systemd-boot / Boot Loader Spec entries (also GRUB's blscfg on Fedora/RHEL)
   for c in "${ESP_CANDIDATES[@]}"; do
     [[ -d $R$c/loader/entries ]] || continue
     name=BLS
     sd=("$R$c"/EFI/systemd/systemd-boot*.efi)
     (( ${#sd[@]} )) && name=systemd-boot
+    if [[ ! -r $R$c/loader/entries || ! -x $R$c/loader/entries ]]; then
+      UNREADABLE_ENTRIES=$c/loader/entries
+      LOADERS+=("$name ($c/loader/entries, not readable as this user)")
+      break
+    fi
     n=0
     for f in "$R$c"/loader/entries/*.conf; do
       n=$((n + 1)); title=${f##*/}
       while read -r key val; do
         case $key in
           title) title=$val ;;
-          linux | initrd | efi) [[ -n $val ]] && ENTRY_PATHS+=("$name"$'\t'"$title"$'\t'"$c"$'\t'"$val") ;;
+          linux | initrd | efi)
+            # RHEL writes `initrd /initramfs-<kver>.img $tuned_initrd`; resolve_path skips the variable
+            read -ra parts <<<"$val"
+            for p in "${parts[@]}"; do ENTRY_PATHS+=("$name"$'\t'"$title"$'\t'"$c"$'\t'"$p"); done ;;
         esac
       done <"$f"
     done
@@ -547,9 +660,10 @@ collect_boot_entries() {
     break
   done
 
-  # GRUB
-  f="$R/boot/grub/grub.cfg"
-  if [[ -f $f ]]; then
+  # GRUB (/boot/grub2 on Fedora/RHEL, where it's usually just blscfg with no menuentries)
+  for cfg in /boot/grub/grub.cfg /boot/grub2/grub.cfg; do
+    f=$R$cfg
+    [[ -f $f ]] || continue
     title=""; n=0
     while IFS= read -r line; do
       if [[ $line =~ $re_menu ]]; then
@@ -561,8 +675,9 @@ collect_boot_entries() {
         for p in "${parts[@]}"; do ENTRY_PATHS+=("GRUB"$'\t'"$title"$'\t'""$'\t'"$p"); done
       fi
     done <"$f"
-    LOADERS+=("GRUB (/boot/grub/grub.cfg, $n entries)")
-  fi
+    LOADERS+=("GRUB ($cfg, $n entries)")
+    break
+  done
 
   # Limine (v8+ limine.conf, older limine.cfg)
   for cfg in /boot/limine.conf /boot/limine/limine.conf /boot/EFI/limine/limine.conf /boot/EFI/BOOT/limine.conf \
@@ -612,11 +727,15 @@ check_boot_entries() {
     return
   fi
   local e loader title hint path res rc base k kver pb key u n=0
-  local -A SEEN=() EXPECT=() COVERED=()
+  local -A SEEN=() EXPECT=() EXPECTK=() COVERED=()
   for k in "${KERNELS[@]}"; do
     IFS=$'\t' read -r kver pb <<<"$k"
-    if [[ $FAMILY == debian ]]; then EXPECT["vmlinuz-$kver"]=$pb; EXPECT["initrd.img-$kver"]=$pb
-    else EXPECT["vmlinuz-$pb"]=$pb; EXPECT["initramfs-$pb.img"]=$pb; fi
+    case $FAMILY in
+      debian) EXPECT["vmlinuz-$kver"]=$pb; EXPECT["initrd.img-$kver"]=$pb ;;
+      rhel) EXPECT["vmlinuz-$kver"]=$pb; EXPECT["initramfs-$kver.img"]=$pb ;;
+      *) EXPECT["vmlinuz-$pb"]=$pb; EXPECT["initramfs-$pb.img"]=$pb ;;
+    esac
+    EXPECTK[$pb]=$kver
   done
   for e in "${ENTRY_PATHS[@]}"; do
     # split by hand: `read` would collapse the empty hint field of GRUB entries
@@ -636,7 +755,7 @@ check_boot_entries() {
       SEEN[$key]=1
       if [[ -n ${EXPECT[$base]:-} ]]; then
         emit FAIL boot-entry "$loader entry \"$title\" points to $path, which doesn't exist (kernel ${EXPECT[$base]} is installed)" \
-          "$(regen_hint "$loader")"
+          "$(regen_hint "$loader" "${EXPECTK[${EXPECT[$base]}]}")"
       else
         emit WARN boot-entry "$loader entry \"$title\" points to $path, which doesn't exist (stale entry?)" \
           "$(regen_hint "$loader")"
@@ -646,21 +765,37 @@ check_boot_entries() {
   for u in "${UKIS[@]}"; do
     pb=$(best_pkgbase_match "${u##*/}")
     [[ -n $pb ]] && COVERED[$pb]=1
+    for k in "${KERNELS[@]}"; do   # Fedora names UKIs <machine-id>-<kver>.efi
+      IFS=$'\t' read -r kver pb <<<"$k"
+      [[ ${u##*/} == *"$kver"* ]] && COVERED[$pb]=1
+    done
   done
+  if [[ -n $UNREADABLE_ENTRIES ]]; then
+    emit WARN permissions "Can't read $UNREADABLE_ENTRIES as this user; boot entries not checked" "sudo updateguard check"
+    COVERED=()
+    for k in "${KERNELS[@]}"; do IFS=$'\t' read -r kver pb <<<"$k"; COVERED[$pb]=1; done
+  fi
   for k in "${KERNELS[@]}"; do
     IFS=$'\t' read -r kver pb <<<"$k"
     if [[ -z ${COVERED[$pb]:-} ]]; then
       emit WARN boot-entry "No boot entry found for $pb ($kver)" "$(regen_hint "${LOADERS[0]%% *}")"
     fi
   done
+  [[ -n $UNREADABLE_ENTRIES ]] && (( n == 0 )) && return
   emit OK bootloader "Boot config parsed: ${LOADERS[*]} — $n file references checked"
 }
 
-regen_hint() {
+regen_hint() {   # LOADER [KVER]
   case $1 in
-    GRUB) if [[ $FAMILY == debian ]]; then printf 'sudo update-grub'; else printf 'sudo grub-mkconfig -o /boot/grub/grub.cfg'; fi ;;
+    GRUB) case $FAMILY in
+            debian) printf 'sudo update-grub' ;;
+            rhel) printf 'sudo grub2-mkconfig -o /boot/grub2/grub.cfg' ;;
+            *) printf 'sudo grub-mkconfig -o /boot/grub/grub.cfg' ;;
+          esac ;;
     Limine) printf 'Regenerate entries (CachyOS: sudo limine-update) or fix limine.conf' ;;
-    systemd-boot | BLS) printf 'Add or fix the entry in loader/entries/*.conf on your ESP' ;;
+    systemd-boot | BLS) if [[ $FAMILY == rhel && -n ${2:-} ]]; then fix_kernel_install "$2"
+      elif [[ $FAMILY == rhel ]]; then printf 'Remove the stale entry: sudo kernel-install remove <kver>, or delete it from /boot/loader/entries'
+      else printf 'Add or fix the entry in loader/entries/*.conf on your ESP'; fi ;;
     *) printf 'Regenerate your bootloader configuration' ;;
   esac
 }
@@ -708,6 +843,7 @@ run_checks() {
     check_kernel "$kver" "$pb"
   done
   check_dkms
+  check_akmods
   check_boot_entries
   check_running_kernel
 }
@@ -752,6 +888,11 @@ boot_files() {   # unprefixed paths of kernel/initramfs/microcode/UKI files wort
       printf '%s\n' "/boot/vmlinuz-$kver" "/boot/initrd.img-$kver" "/boot/config-$kver" "/boot/System.map-$kver"
       continue
     fi
+    if [[ $FAMILY == rhel ]]; then
+      printf '%s\n' "/boot/vmlinuz-$kver" "/boot/initramfs-$kver.img" "/boot/config-$kver" "/boot/System.map-$kver"
+      for f in "$R"/boot/loader/entries/*-"$kver".conf; do printf '%s\n' "${f#"$R"}"; done
+      continue
+    fi
     pf=$(preset_file "$pb")
     [[ -f $pf ]] || continue
     v=$(preset_get "$pf" ALL_kver) && printf '%s\n' "$v"
@@ -770,8 +911,8 @@ boot_files() {   # unprefixed paths of kernel/initramfs/microcode/UKI files wort
 backup_boot() {   # ID
   local id=$1 dest="$STATE_DIR/boot/$1" f bytes=0 mb avail list=() keep=() seps
   seps=$(separate_boot_mounts)
-  # Debian keeps kernels in /boot even when the ESP is mounted at /boot/efi
-  [[ $FAMILY == debian ]] && ! fstab_has /boot && seps=""
+  # Debian and Fedora/RHEL keep kernels in /boot even when the ESP is mounted at /boot/efi
+  [[ $FAMILY != arch ]] && ! fstab_has /boot && seps=""
   if [[ -z $seps ]]; then
     emit INFO boot-backup "Kernel and initramfs live on the root filesystem, so the snapshot already covers them"
     return 0
@@ -844,7 +985,7 @@ pre_flow() {   # returns 1 only when the transaction should be aborted
 
   if ! check_boot_mounts; then
     if [[ $DRY_RUN != 1 && $ABORT_ON_UNMOUNTED_BOOT == 1 ]]; then
-      out "==> updateguard: ABORTING. Mount the boot partition, then run $([[ $FAMILY == debian ]] && echo apt || echo pacman) again."
+      out "==> updateguard: ABORTING. Mount the boot partition, then run $(pm_name) again."
       meta_set "$id" result aborted-unmounted-boot
       history_add "$id" ABORTED "boot partition not mounted"
       rm -f "$RUN_DIR/pending"
@@ -898,7 +1039,9 @@ pre_flow() {   # returns 1 only when the transaction should be aborted
   return 0
 }
 
-cmd_hook_pre() {   # [--apt]
+cmd_hook_pre() {   # [--apt|--dnf5]
+  # dnf5's actions plugin parses a hook's stdout as commands, so talk to the user on stderr
+  [[ ${1:-} == --dnf5 ]] && exec 1>&2
   read_targets "$@"; load_patterns; filter_risky
   (( ${#RISKY[@]} )) || exit 0
   pre_flow || exit 1
@@ -936,9 +1079,13 @@ post_flow() {   # ID ; returns 1 on FAIL
   return 0
 }
 
-cmd_hook_post() {   # [--apt]: DPkg::Post-Invoke gets no package list; relies on the pending id from hook-pre
+cmd_hook_post() {   # [--apt|--dnf5]: these get no package list; they rely on the pending id from hook-pre
   local pend="" id age
-  [[ ${1:-} == --apt ]] || read_targets
+  case ${1:-} in
+    --apt) ;;
+    --dnf5) exec 1>&2; rm -f "$RUN_DIR/dnf-targets" ;;
+    *) read_targets ;;
+  esac
   load_patterns; filter_risky
   if [[ -r $RUN_DIR/pending ]]; then
     age=$(( $(date +%s) - $(stat -c %Y "$RUN_DIR/pending") ))
@@ -984,7 +1131,7 @@ cmd_simulate() {
 }
 
 cmd_doctor() {
-  local k kver pb pf mods backend sb hooks="" mp ac="$R/etc/apt/apt.conf.d/05updateguard"
+  local k kver pb pf mods backend sb hooks="" mp ac="$R/etc/apt/apt.conf.d/05updateguard" f
   load_kernels; collect_boot_entries
   backend=$(pick_backend); sb=$(snapshot_boot_tool)
   printf 'updateguard %s — environment\n\n' "$VERSION"
@@ -1000,6 +1147,13 @@ cmd_doctor() {
       grep -q 'Post-Invoke' "$ac" && hooks="${hooks:+$hooks + }post"
     fi
     row "apt hooks" "${hooks:-NOT installed (run: sudo ./install.sh --apply)}"
+  elif [[ $FAMILY == rhel ]]; then
+    for f in "$R"/usr/lib/python3*/site-packages/dnf-plugins/updateguard.py; do
+      [[ -f $R/etc/dnf/plugins/updateguard.conf ]] && grep -qiE '^enabled[[:space:]]*=[[:space:]]*(1|true|yes)' "$R/etc/dnf/plugins/updateguard.conf" &&
+        hooks="dnf4 plugin (${f#"$R"})"
+    done
+    [[ -f $R/etc/dnf/libdnf5-plugins/actions.d/updateguard.actions ]] && hooks="${hooks:+$hooks + }dnf5 actions"
+    row "dnf hooks" "${hooks:-NOT installed (run: sudo ./install.sh --apply)}"
   else
     find_hook_file >/dev/null && hooks="pre"
     [[ -f $R/usr/share/libalpm/hooks/zzz-updateguard-post.hook || -f $R/etc/pacman.d/hooks/zzz-updateguard-post.hook ]] && hooks="${hooks:+$hooks + }post"
@@ -1028,6 +1182,8 @@ cmd_doctor() {
     IFS=$'\t' read -r kver pb <<<"$k"
     if [[ $FAMILY == debian ]]; then
       pf="no initrd"; [[ -e $R/boot/initrd.img-$kver ]] && pf="initrd"
+    elif [[ $FAMILY == rhel ]]; then
+      pf="no initramfs"; [[ -e $R/boot/initramfs-$kver.img ]] && pf="initramfs"
     else
       pf="no preset"; [[ -f $(preset_file "$pb") ]] && pf="preset ok"
     fi
@@ -1037,6 +1193,9 @@ cmd_doctor() {
   if command -v dkms >/dev/null 2>&1; then
     mods=$(dkms status 2>/dev/null | sed -E 's/[,:].*//' | sort -u | paste -sd' ' -)
     row "DKMS" "${mods:-no modules}"
+  fi
+  if [[ $FAMILY == rhel ]] && mods=$(printf '%s\n' "$R"/usr/src/akmods/*-kmod.latest | sed -E 's#.*/##; s/-kmod\.latest$//' | paste -sd' ' -) && [[ -n $mods ]]; then
+    row "akmods" "$mods"
   fi
   if fstab_root_pins_subvolid; then
     printf '\n  note: /etc/fstab pins / by subvolid=. A restored snapshot gets a new subvolume ID, so\n'

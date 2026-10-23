@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Test stub. Fake rpmdb in $T_RPM_DB, one package per line: "NVRA<TAB>INSTALLTIME<TAB>owned paths".
+# Supports `rpm -qf [--qf FMT] FILE` (prints the NVRA) and `rpm -q [--qf %{INSTALLTIME}] PKG`.
+db=${T_RPM_DB:-/dev/null} mode=q qf="" args=()
+while (( $# )); do
+  case $1 in
+    -qf) mode=qf ;;
+    -q) mode=q ;;
+    --qf | --queryformat) qf=$2; shift ;;
+    *) args+=("$1") ;;
+  esac
+  shift
+done
+for a in "${args[@]}"; do
+  if [[ $mode == qf ]]; then
+    rel=${a#"$UG_ROOT"}
+    while IFS=$'\t' read -r nvra _ paths; do
+      for p in $paths; do [[ $p == "$rel" ]] && { echo "$nvra"; continue 3; }; done
+    done <"$db"
+    echo "file $a is not owned by any package"; exit 1
+  fi
+  while IFS=$'\t' read -r nvra t _; do
+    # match a full NVRA, or a package name followed by its version
+    if [[ $nvra == "$a" || $nvra == "$a"-[0-9]* ]]; then
+      if [[ $qf == *INSTALLTIME* ]]; then echo "$t"; else echo "$nvra"; fi
+      continue 2
+    fi
+  done <"$db"
+  echo "package $a is not installed"; exit 1
+done

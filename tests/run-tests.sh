@@ -365,6 +365,245 @@ make_ubuntu; export T_MOUNTED=""; conf DRY_RUN=0
 run "$APT_IN" hook-pre --apt; rc_is 1 "unmounted /boot/efi aborts apt in active mode"
 has "run apt again" "abort message names apt"
 
+# make_fedora: Fedora 41, btrfs root, ext4 /boot, ESP at /boot/efi, GRUB with blscfg, akmod-nvidia,
+# and a removed kernel's leftover extra/ dir
+FKVER=6.11.4-301.fc41.x86_64
+FPKG=kernel-core-$FKVER
+MID=0123456789abcdef0123456789abcdef
+make_fedora() {
+  ROOT=$(mktemp -d "${TMPDIR:-/tmp}/ugtest.XXXXXX")
+  mkdir -p "$ROOT"/{etc/dnf,boot/loader/entries,boot/grub2,boot/efi,run,var/lib,usr/src/akmods}
+  mkdir -p "$ROOT/usr/lib/modules/$FKVER/build" "$ROOT/usr/lib/modules/6.10.12-200.fc40.x86_64/extra"
+  printf 'NAME="Fedora Linux"\nID=fedora\nPRETTY_NAME="Fedora Linux 41 (Workstation Edition)"\n' >"$ROOT/etc/os-release"
+  cat >"$ROOT/etc/fstab" <<EOF
+UUID=1111-2222-3333 /         btrfs subvol=root,compress=zstd:1 0 0
+UUID=4444-5555      /boot     ext4  defaults 1 2
+UUID=ABCD-1234      /boot/efi vfat  umask=0077,shortname=winnt 0 2
+EOF
+  printf 'KERNEL-%s\n' "$FKVER" >"$ROOT/usr/lib/modules/$FKVER/vmlinuz"
+  cp "$ROOT/usr/lib/modules/$FKVER/vmlinuz" "$ROOT/boot/vmlinuz-$FKVER"
+  printf 'usr/lib/modules/%s/kernel/drivers/x.ko\n' "$FKVER" >"$ROOT/boot/initramfs-$FKVER.img"
+  touch -d '2026-10-02' "$ROOT/boot/initramfs-$FKVER.img"
+  cat >"$ROOT/boot/loader/entries/$MID-$FKVER.conf" <<EOF
+title Fedora Linux ($FKVER) 41 (Workstation Edition)
+version $FKVER
+linux /vmlinuz-$FKVER
+initrd /initramfs-$FKVER.img
+options root=UUID=1111-2222-3333 ro rootflags=subvol=root rhgb quiet
+grub_class fedora
+EOF
+  printf 'set default_kernelopts=""\nblscfg\n' >"$ROOT/boot/grub2/grub.cfg"
+  : >"$ROOT/usr/src/akmods/nvidia-kmod.latest"
+  printf '%s\t%s\t%s\n' "$FPKG" "$(date -d '2026-10-01' +%s)" "/usr/lib/modules/$FKVER/vmlinuz" \
+    "kmod-nvidia-$FKVER-560.35.03-1.fc41.x86_64" "$(date -d '2026-10-01' +%s)" "" >"$ROOT/rpmdb.txt"
+  : >"$ROOT/dkms.txt"
+  export T_RPM_DB="$ROOT/rpmdb.txt" T_DKMS_FILE="$ROOT/dkms.txt" T_MOUNTED="/boot /boot/efi" T_FSTYPE=btrfs
+  export T_SNAPPER=0 T_SOURCE="/dev/nvme0n1p3[/root]" T_UNAME_R=$FKVER T_DF_AVAIL=400 T_BTRFS_FAIL=0
+}
+
+echo "== 16. Fedora: healthy system, dnf 4 hooks"
+make_fedora
+run "" check; rc_is 0 "check exits 0"
+has "$FPKG: /boot/vmlinuz-$FKVER matches installed kernel $FKVER" "kernel verified against /usr/lib/modules"
+has "/boot/initramfs-$FKVER.img is current" "dracut initramfs verified"
+has "BLS (/boot/loader/entries, 1 entries)" "BLS entries parsed"
+has "GRUB (/boot/grub2/grub.cfg, 0 entries)" "grub2 blscfg detected"
+hasnt "No boot entry found" "BLS entry matched to installed kernel"
+hasnt "6.10.12-200" "removed kernel's leftover modules dir ignored"
+has "akmods modules built (nvidia)" "akmods kmod verified"
+run "$(printf 'kernel-core\nkernel-modules\nfirefox\n')" hook-pre; rc_is 0 "pre exits 0"
+has "2 risky package(s): kernel-core kernel-modules" "dnf package list filtered"
+has "would take a btrfs snapshot" "btrfs backend on Fedora"
+has "would copy" "plans a backup of the separate /boot"
+run "kernel-core" hook-post; rc_is 0 "post exits 0"
+has "boot looks healthy" "post verifies after dnf"
+run "" simulate kernel-core kernel-headers kernel-tools kernel-srpm-macros akmod-nvidia grub2-efi-x64 glibc firefox
+has "risky   kernel-core" "kernel-core risky"
+has "ignored kernel-headers" "kernel-headers ignored"
+has "ignored kernel-tools" "kernel-tools ignored"
+has "ignored kernel-srpm-macros" "kernel-srpm-macros ignored"
+has "risky   akmod-nvidia" "akmod risky"
+has "risky   grub2-efi-x64" "grub2 risky"
+has "risky   glibc" "glibc risky"
+run "" doctor
+has "Fedora Linux 41 (Workstation Edition) (rhel backend)" "doctor shows distro"
+has "dnf hooks:" "doctor checks dnf hooks"
+has "NOT installed" "doctor notices missing dnf hooks"
+has "$FPKG $FKVER (initramfs, headers)" "doctor lists Fedora kernel"
+has "akmods:" "doctor lists akmods"
+mkdir -p "$ROOT/usr/lib/python3.13/site-packages/dnf-plugins" "$ROOT/etc/dnf/plugins"
+: >"$ROOT/usr/lib/python3.13/site-packages/dnf-plugins/updateguard.py"
+printf '[main]\nenabled=1\n' >"$ROOT/etc/dnf/plugins/updateguard.conf"
+run "" doctor; has "dnf4 plugin (/usr/lib/python3.13/site-packages/dnf-plugins/updateguard.py)" "doctor finds dnf4 plugin"
+conf DRY_RUN=0; export UG_NOW=20261020-080000
+run "kernel-core" hook-pre; has "Took btrfs snapshot" "snapshot taken in active mode"
+[[ -f $ROOT/var/lib/updateguard/boot/20261020-080000/boot/loader/entries/$MID-$FKVER.conf ]] && ok "BLS entry backed up with the kernel" || bad "BLS entry backed up with the kernel"
+[[ -f $ROOT/var/lib/updateguard/boot/20261020-080000/boot/initramfs-$FKVER.img ]] && ok "initramfs backed up" || bad "initramfs backed up"
+unset UG_NOW
+
+echo "== 17. Fedora: dnf5 actions"
+make_fedora
+run "" hook-note kernel-core; run "" hook-note firefox; run "" hook-note kernel-core
+[[ $(sort -u "$ROOT/run/updateguard/dnf-targets" | wc -l) == 2 ]] && ok "hook-note records package names" || bad "hook-note records package names"
+OUT=$(env UG_ROOT="$ROOT" UG_CONF="$ROOT/etc/updateguard.conf" UG_RUN_DIR="$ROOT/run/updateguard" "$UG" hook-pre --dnf5 2>/dev/null)
+[[ -z $OUT ]] && ok "dnf5 hooks keep stdout clean for the actions plugin" || bad "dnf5 hooks keep stdout clean for the actions plugin"
+run "" hook-note kernel-core; run "" hook-note firefox
+run "" hook-pre --dnf5; rc_is 0 "dnf5 pre exits 0"
+has "1 risky package(s): kernel-core" "dnf5 collected list filtered"
+[[ ! -e $ROOT/run/updateguard/dnf-targets ]] && ok "collected list consumed" || bad "collected list consumed"
+run "" hook-post --dnf5; rc_is 0 "dnf5 post exits 0"
+has "boot looks healthy" "dnf5 post verifies via the pending id"
+run "" hook-note firefox; run "" hook-pre --dnf5
+[[ -z $OUT ]] && ok "dnf5: no output for non-risky packages" || bad "dnf5: no output for non-risky packages"
+export T_MOUNTED="/boot/efi"; conf DRY_RUN=0
+run "" hook-note kernel-core; run "" hook-pre --dnf5; rc_is 1 "unmounted /boot aborts dnf in active mode"
+has "run dnf again" "abort message names dnf"
+
+echo "== 18. Fedora: failures and fixes"
+make_fedora
+printf '%s\t%s\t%s\n' "kmod-other-1-1.fc41.x86_64" 0 "" >"$ROOT/rpmdb.tmp"
+grep -v '^kmod-nvidia' "$ROOT/rpmdb.txt" >>"$ROOT/rpmdb.tmp"; mv "$ROOT/rpmdb.tmp" "$ROOT/rpmdb.txt"
+run "" check; has "kmod-nvidia not built for $FKVER yet" "missing akmods kmod warned"
+has "sudo akmods --force --kernels $FKVER" "akmods rebuild suggested"
+make_fedora
+DKVER=6.11.4-301.fc41.x86_64+debug
+mkdir -p "$ROOT/usr/lib/modules/$DKVER"; printf 'DEBUG\n' >"$ROOT/usr/lib/modules/$DKVER/vmlinuz"
+printf '%s\t%s\t%s\n' "kernel-debug-core-$FKVER" 0 "/usr/lib/modules/$DKVER/vmlinuz" >>"$ROOT/rpmdb.txt"
+printf 'nvidia/560.35.03, %s, x86_64: installed\n' "$FKVER" >"$ROOT/dkms.txt"
+run "" check
+has "sudo dnf install kernel-debug-devel-$FKVER && sudo dkms autoinstall -k $DKVER" "devel package derived from the debug kernel's NVRA"
+has "kernel-debug-core-$FKVER: /boot/vmlinuz-$DKVER is missing" "missing /boot kernel detected"
+has "sudo kernel-install add $DKVER /usr/lib/modules/$DKVER/vmlinuz" "kernel-install suggested"
+has "sudo dracut -f --kver $DKVER" "dracut suggested for missing initramfs"
+
+# make_rocky: Rocky 8, xfs root, /boot on the root fs, ESP at /boot/efi, RHEL-style BLS, DKMS
+RKVER=4.18.0-553.176.1.el8_10.x86_64
+RPKG=kernel-core-$RKVER
+make_rocky() {
+  ROOT=$(mktemp -d "${TMPDIR:-/tmp}/ugtest.XXXXXX")
+  mkdir -p "$ROOT"/{etc/dnf,boot/loader/entries,boot/efi,run,var/lib} "$ROOT/usr/lib/modules/$RKVER/build"
+  mkdir -p "$ROOT/usr/lib/modules/4.18.0-553.el8_10.x86_64/extra"
+  printf 'NAME="Rocky Linux"\nID="rocky"\nID_LIKE="rhel centos fedora"\nPRETTY_NAME="Rocky Linux 8.10 (Green Obsidian)"\n' >"$ROOT/etc/os-release"
+  cat >"$ROOT/etc/fstab" <<EOF
+UUID=1111-2222-3333 /         xfs  defaults 0 0
+UUID=ABCD-1234      /boot/efi vfat umask=077,shortname=winnt 0 2
+EOF
+  printf 'KERNEL-%s\n' "$RKVER" >"$ROOT/usr/lib/modules/$RKVER/vmlinuz"
+  cp "$ROOT/usr/lib/modules/$RKVER/vmlinuz" "$ROOT/boot/vmlinuz-$RKVER"
+  printf 'usr/lib/modules/%s/kernel/x.ko\n' "$RKVER" >"$ROOT/boot/initramfs-$RKVER.img"
+  touch -d '2026-10-02' "$ROOT/boot/initramfs-$RKVER.img"
+  printf 'RESCUE\n' >"$ROOT/boot/vmlinuz-0-rescue-$MID"; printf 'x\n' >"$ROOT/boot/initramfs-0-rescue-$MID.img"
+  cat >"$ROOT/boot/loader/entries/$MID-$RKVER.conf" <<EOF
+title Rocky Linux ($RKVER) 8.10 (Green Obsidian)
+version $RKVER
+linux /vmlinuz-$RKVER
+initrd /initramfs-$RKVER.img \$tuned_initrd
+options \$kernelopts \$tuned_params
+id rocky-20261022-$RKVER
+grub_users \$grub_users
+grub_arg --unrestricted
+grub_class kernel
+EOF
+  cat >"$ROOT/boot/loader/entries/$MID-0-rescue.conf" <<EOF
+title Rocky Linux (0-rescue-$MID) 8.10 (Green Obsidian)
+linux /vmlinuz-0-rescue-$MID
+initrd /initramfs-0-rescue-$MID.img
+EOF
+  printf '%s\t%s\t%s\n' "$RPKG" "$(date -d '2026-10-01' +%s)" "/usr/lib/modules/$RKVER/vmlinuz" >"$ROOT/rpmdb.txt"
+  printf 'nvidia/560.35.03, %s, x86_64: installed\n' "$RKVER" >"$ROOT/dkms.txt"
+  export T_RPM_DB="$ROOT/rpmdb.txt" T_DKMS_FILE="$ROOT/dkms.txt" T_MOUNTED="/boot/efi" T_FSTYPE=xfs
+  export T_SNAPPER=0 T_SOURCE=/dev/nvme0n1p3 T_UNAME_R=$RKVER T_DF_AVAIL=400 T_BTRFS_FAIL=0
+}
+
+echo "== 19. Rocky 8: healthy system, then failures"
+make_rocky
+run "" check; rc_is 0 "check exits 0"
+has "$RPKG: /boot/vmlinuz-$RKVER matches installed kernel" "Rocky kernel verified"
+has "BLS (/boot/loader/entries, 2 entries)" "RHEL BLS entries parsed"
+hasnt "tuned_initrd" "GRUB variables in BLS entries skipped"
+hasnt "doesn't exist" "rescue entry and kernel entry resolve"
+hasnt "4.18.0-553.el8_10" "removed kernel's leftover extra/ ignored"
+has "DKMS modules installed (nvidia)" "dkms verified"
+run "kernel-core" hook-pre
+has "No snapshot backend (root is xfs" "xfs root: verify only"
+make_rocky
+printf 'OLD-KERNEL\n' >"$ROOT/boot/vmlinuz-$RKVER"
+run "" check; rc_is 1 "check exits 1"
+has "/boot/vmlinuz-$RKVER doesn't match installed kernel $RKVER" "stale /boot kernel detected"
+has "sudo kernel-install add $RKVER /usr/lib/modules/$RKVER/vmlinuz" "kernel-install fix suggested"
+make_rocky
+touch -d '2026-09-30' "$ROOT/boot/initramfs-$RKVER.img"
+run "" check; has "initramfs-$RKVER.img is older than the installed kernel" "stale initramfs detected via rpm INSTALLTIME"
+has "sudo dracut -f --kver $RKVER" "dracut fix suggested"
+make_rocky
+printf 'usr/lib/modules/4.18.0-553.el8_10.x86_64/kernel/x.ko\n' >"$ROOT/boot/initramfs-$RKVER.img"
+touch -d '2026-10-02' "$ROOT/boot/initramfs-$RKVER.img"
+run "" check; has "built for a different kernel" "wrong-kernel initramfs detected via lsinitrd"
+make_rocky
+rm -rf "$ROOT/usr/lib/modules/$RKVER/build"
+run "" check; has "sudo dnf install kernel-devel-$RKVER && sudo dkms autoinstall -k $RKVER" "kernel-devel fix suggested"
+make_rocky
+sed -i "s#^linux /vmlinuz-$RKVER#linux /vmlinuz-$RKVER-gone#" "$ROOT/boot/loader/entries/$MID-$RKVER.conf"
+run "" check; has "vmlinuz-$RKVER-gone, which doesn't exist (stale entry?)" "stale BLS entry warned"
+has "sudo kernel-install remove" "kernel-install remove suggested for stale entry"
+make_rocky
+rm "$ROOT/boot/initramfs-$RKVER.img"
+run "" check; has "points to /initramfs-$RKVER.img, which doesn't exist (kernel $RPKG is installed)" "BLS entry with missing initramfs fails"
+if (( EUID != 0 )); then
+  make_rocky; chmod 000 "$ROOT/boot/loader/entries"
+  run "" check; has "Can't read /boot/loader/entries as this user" "0700 BLS dir handled without sudo"
+  hasnt "No boot entry found" "no false missing-entry warnings when entries are unreadable"
+  hasnt "0 file references checked" "no OK verdict for boot entries it couldn't read"
+  chmod 755 "$ROOT/boot/loader/entries"
+fi
+
+echo "== 20. dnf 4 plugin (fake dnf module)"
+if command -v python3 >/dev/null; then
+  W=$(mktemp -d "${TMPDIR:-/tmp}/ugdnf.XXXXXX")
+  # shellcheck disable=SC2016  # the fake binary expands these itself
+  printf '#!/usr/bin/env bash\n{ echo "ARGS $*"; cat; } >>"%s/log"\n[[ $1 == hook-pre ]] && exit "${T_PRE_RC:-0}"\nexit 0\n' "$W" >"$W/bin"
+  chmod +x "$W/bin"
+  OUT=$(python3 -I - "$HERE/../dnf/updateguard.py" "$W/bin" "$W/log" <<'EOF' 2>&1
+import importlib.util, os, sys, types
+from types import SimpleNamespace as NS
+dnf = types.ModuleType('dnf'); exc = types.ModuleType('dnf.exceptions')
+class Error(Exception): pass
+class Plugin:
+    def __init__(self, base, cli): self.base = base
+exc.Error = Error; dnf.exceptions = exc; dnf.Plugin = Plugin
+sys.modules['dnf'] = dnf; sys.modules['dnf.exceptions'] = exc
+spec = importlib.util.spec_from_file_location('ugplugin', sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+m.BIN, log = sys.argv[2], sys.argv[3]
+def base(root='/', flags=()):
+    t = NS(install_set=[NS(name='kernel-core'), NS(name='firefox')], remove_set=[NS(name='kernel-core')])
+    return NS(conf=NS(installroot=root, tsflags=list(flags)), transaction=t)
+def logged():
+    if not os.path.exists(log): return ''
+    s = open(log).read(); os.remove(log); return s
+p = m.UpdateGuard(base(), None); p.pre_transaction()
+print('pre-call:', repr(logged()))
+p.transaction(); print('post-call:', repr(logged()))
+os.environ['T_PRE_RC'] = '1'
+try: p.pre_transaction(); print('rc1: no exception')
+except Error as e: print('rc1: raised', e)
+logged(); del os.environ['T_PRE_RC']
+m.UpdateGuard(base('/mnt/sysimage'), None).pre_transaction(); print('installroot:', repr(logged()))
+m.UpdateGuard(base(flags=['test']), None).pre_transaction(); print('test-flag:', repr(logged()))
+m.BIN = '/nonexistent/updateguard'; m.UpdateGuard(base(), None).pre_transaction(); print('missing-bin: ok')
+EOF
+)
+  has "pre-call: 'ARGS hook-pre\\nfirefox\\nkernel-core\\n'" "plugin passes sorted unique names to hook-pre"
+  has "post-call: 'ARGS hook-post\\nfirefox\\nkernel-core\\n'" "plugin runs hook-post after the transaction"
+  has "rc1: raised updateguard stopped the transaction" "hook-pre exit 1 aborts dnf"
+  has "installroot: ''" "plugin ignores --installroot transactions"
+  has "test-flag: ''" "plugin ignores test transactions"
+  has "missing-bin: ok" "missing binary doesn't break dnf"
+  rm -rf "$W"
+else
+  echo "  skip dnf plugin tests (need python3)"
+fi
+
 echo
 echo "$PASS passed, $FAIL failed"
 (( FAIL == 0 ))

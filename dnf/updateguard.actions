@@ -1,0 +1,7 @@
+# updateguard dnf5 actions (Fedora 41+). Needs libdnf5-plugin-actions; raise_error needs 1.4+.
+# dnf5 can't hand one command the package list, so hook-note records each package name,
+# then hook-pre runs once with the whole list. Actions run in file order.
+# The first word of each command is the binary path; install.sh rewrites all of them together.
+pre_transaction:*::enabled=host-only:/usr/bin/updateguard hook-note ${pkg.name}
+pre_transaction:::enabled=host-only raise_error=1:/usr/bin/updateguard hook-pre --dnf5
+post_transaction:::enabled=host-only:/usr/bin/updateguard hook-post --dnf5

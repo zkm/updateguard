@@ -2,7 +2,7 @@
 
 Snapshot before risky OS updates, then verify the machine will still boot
 before you reboot. v0.2.0: Arch and CachyOS (pacman), plus Debian and Ubuntu
-(apt) in preview. (Name is a placeholder; check the AUR and GitHub before
+(apt) and Fedora, RHEL, Rocky and Alma (dnf) in preview. (Name is a placeholder; check the AUR and GitHub before
 publishing.)
 
 ## What it does
@@ -41,7 +41,7 @@ Arch / CachyOS:
 
 ```bash
 git clone https://github.com/zkm/updateguard.git && cd updateguard
-bash tests/run-tests.sh          # optional: 114 checks against fake systems
+bash tests/run-tests.sh          # optional: 187 checks against fake systems
 makepkg -si                      # or: ./install.sh, then sudo ./install.sh --apply
 sudo updateguard doctor
 ```
@@ -66,6 +66,37 @@ can abort apt; the post hook runs from `DPkg::Post-Invoke`, after
 update-initramfs, update-grub and DKMS. Uninstall with
 `sudo ./install.sh --uninstall` (removing only the binary would break apt).
 
+Fedora / RHEL / Rocky / Alma (preview):
+
+```bash
+git clone https://github.com/zkm/updateguard.git && cd updateguard
+./install.sh                     # shows which dnf hook it will use; changes nothing
+sudo ./install.sh --apply        # binary to /usr/local/bin, plus the dnf hook below
+sudo updateguard doctor
+```
+
+dnf 4 (RHEL/Rocky/Alma 8–10, CentOS Stream, Fedora 40 and older) gets a plugin
+in dnf's own `dnf-plugins/` directory plus `/etc/dnf/plugins/updateguard.conf`.
+Its `pre_transaction` runs after dnf's test transaction and can abort dnf; its
+`transaction` hook runs after rpm's scriptlets (kernel-install, dracut, DKMS)
+have finished. dnf5 (Fedora 41+) gets
+`/etc/dnf/libdnf5-plugins/actions.d/updateguard.actions`, which needs
+`sudo dnf install libdnf5-plugin-actions` (1.4+ so it can abort a transaction).
+
+The checks follow the Fedora/RHEL layout: `/boot/vmlinuz-<kver>` must
+byte-match `/usr/lib/modules/<kver>/vmlinuz`, and `/boot/initramfs-<kver>.img`
+must be newer than rpm's install time for the kernel and contain its modules
+(`lsinitrd`). BLS entries in `/boot/loader/entries` are checked, including
+RHEL's `$tuned_initrd` lines. Kernels are identified by the rpm that owns
+their `vmlinuz`, so leftover `extra/` and `weak-updates/` directories from
+removed kernels are ignored. Fixes point at `kernel-install add`, `dracut -f
+--kver`, `dnf install kernel-devel-<version>` and, for RPM Fusion's NVIDIA
+driver, `akmods --force`. On a non-root run RHEL's 0700 `/boot/loader/entries`
+and 0600 initramfs images produce one `permissions` warning, so use
+`sudo updateguard check` for the full picture. Root is usually XFS or ext4 on
+RHEL-family servers, so they get verification only. Fedora's btrfs root gets
+snapper or raw btrfs snapshots.
+
 ## Commands
 
 ```
@@ -86,7 +117,13 @@ updateguard prune               delete snapshots/boot backups beyond KEEP
 - If fstab pins `/` by `subvolid=`, `doctor` tells you to drop it. A restored
   snapshot gets a new subvolume ID.
 - On Arch, dracut, booster and kernel-install layouts get boot-entry checks
-  but not the /boot image checks yet. RHEL-family distros aren't supported yet.
+  but not the /boot image checks yet.
+- Fedora/RHEL: only the default `/boot/vmlinuz-<kver>` layout gets image
+  checks. systemd-boot's `$ESP/<machine-id>/<kver>/` layout and
+  `kernel-uki-virt` UKIs get boot-entry checks only. PackageKit (GNOME
+  Software, offline updates) doesn't load dnf plugins, so those updates
+  aren't guarded. A missing akmods kmod is a warning, not a failure,
+  because akmods retries at boot.
 - A DKMS module that deliberately excludes a kernel (`BUILD_EXCLUSIVE`) will
   show as a failure for that kernel.
 - UKIs are verified by contents, not timestamps. mkinitcpio builds UKIs with
@@ -95,7 +132,10 @@ updateguard prune               delete snapshots/boot backups beyond KEEP
   updateguard falls back to timestamps and may report false failures.
 - Tested against simulated systems (`tests/`) and one real Arch machine
   (systemd-boot, UKI-only, `linux` + `linux-zen`). The Debian/Ubuntu backend
-  has only run against simulated systems. Run `doctor` and stay in
+  has only run against simulated systems. The RHEL backend's `doctor` and
+  `check` have run unprivileged on one real Rocky 8.10 machine (xfs root, BLS,
+  DKMS). The dnf 4 plugin has been loaded by real dnf 4.7 but hasn't yet
+  guarded a real transaction, and the dnf5 actions file is untested. Run `doctor` and stay in
   dry run until it matches what you know about the machine.
 
 ## Roadmap
@@ -108,8 +148,11 @@ first, then the RHEL family. Arch stays the dogfooding platform.
    a `.deb` package (its apt hook must be removed on `apt remove`, not just
    purge), and rollback for ext4 servers (LVM snapshots or timeshift), since
    most of them have no btrfs.
-2. **RHEL family** (Rocky, Alma, Fedora): dnf plugin, dracut (`lsinitrd`),
-   `kernel-install` and BLS entries, snapper on Fedora's btrfs.
+2. **RHEL family** (in progress): dnf 4 plugin and dnf5 actions, rpm-based
+   kernel checks, dracut (`lsinitrd`), `kernel-install` and BLS entries, akmods.
+   Next: real transactions on Rocky/Alma 9 and Fedora 41+ VMs, an `.rpm`
+   package, LVM snapshots for XFS/ext4 servers, and the systemd-boot
+   `kernel-install` layout.
 3. **Fleet reporting**: `check --json` from every machine to a dashboard, with
    alerts when a server shouldn't be rebooted.
 4. **Automatic rollback**, once the checks have proven themselves on real
@@ -118,7 +161,7 @@ first, then the RHEL family. Arch stays the dogfooding platform.
 ## Development
 
 ```bash
-bash tests/run-tests.sh          # fake Arch and Ubuntu systems under a temp root; no sudo needed
+bash tests/run-tests.sh          # fake Arch, Ubuntu, Fedora and Rocky systems under a temp root; no sudo needed
 shellcheck updateguard tests/run-tests.sh install.sh
 ```
 
