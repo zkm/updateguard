@@ -71,7 +71,7 @@ Fedora / RHEL / Rocky / Alma (preview):
 ```bash
 git clone https://github.com/zkm/updateguard.git && cd updateguard
 ./install.sh                     # shows which dnf hook it will use; changes nothing
-sudo ./install.sh --apply        # binary to /usr/local/bin, plus the dnf hook below
+sudo ./install.sh --apply        # binary to /usr/local/bin (linked from /usr/sbin, which sudo searches), plus the dnf hook below
 sudo updateguard doctor
 ```
 
