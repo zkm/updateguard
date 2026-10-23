@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Test stub. T_PGREP lists the process names that are "running"; supports `pgrep -x NAME`.
+[[ $1 == -x ]] && shift
+for p in ${T_PGREP:-}; do [[ $p == "$1" ]] && { echo 4242; exit 0; }; done
+exit 1

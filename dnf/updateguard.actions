@@ -1,0 +1,9 @@
+# updateguard dnf5 actions (Fedora 41+). Needs libdnf5-plugin-actions 1.4+ for the `stop=` output line.
+# dnf5 can't hand one command the package list, so hook-note records each package name,
+# then hook-pre runs once with the whole list. Actions run in file order.
+# No raise_error: a leftover file pointing at a removed binary, or a crash, must not break dnf.
+# hook-pre aborts the transaction by printing `stop=<message>`, which it only does when DRY_RUN=0.
+# The first word of each command is the binary path; install.sh rewrites all of them together.
+pre_transaction:*::enabled=host-only:/usr/bin/updateguard hook-note ${pkg.name}
+pre_transaction:::enabled=host-only:/usr/bin/updateguard hook-pre --dnf5
+post_transaction:::enabled=host-only:/usr/bin/updateguard hook-post --dnf5

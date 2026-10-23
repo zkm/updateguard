@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Test stub. Fake rpmdb in $T_RPM_DB, one package per line: "NVRA<TAB>INSTALLTIME<TAB>owned paths".
+# Supports `rpm -qf [--qf FMT] FILE...` and `rpm -q [--qf FMT] PKG...`, where FMT may use %{INSTALLTIME},
+# %{NAME} and the NVRA pieces. Like rpm, it keeps going past misses and exits with how many it missed.
+# T_RPM_LOG, if set, gets one line per invocation.
+db=${T_RPM_DB:-/dev/null} mode=q qf="" args=() miss=0
+[[ -n ${T_RPM_LOG:-} ]] && echo "rpm $*" >>"$T_RPM_LOG"
+while (( $# )); do
+  case $1 in
+    -qf) mode=qf ;;
+    -q) mode=q ;;
+    --qf | --queryformat) qf=$2; shift ;;
+    *) args+=("$1") ;;
+  esac
+  shift
+done
+fmt() {   # NVRA TIME
+  local name=${1%-*-*}
+  if [[ -z $qf ]]; then echo "$1"; return; fi
+  if [[ $qf == *INSTALLTIME* && $qf != *NAME* ]]; then echo "$2"; return; fi
+  if [[ $qf == '%{NAME}\n' ]]; then echo "$name"; return; fi
+  if [[ $qf == *INSTALLTIME* ]]; then printf '%s\t%s\n' "$1" "$2"; return; fi
+  echo "$1"
+}
+for a in "${args[@]}"; do
+  if [[ $mode == qf ]]; then
+    rel=${a#"$UG_ROOT"}
+    while IFS=$'\t' read -r nvra t paths; do
+      for p in $paths; do [[ $p == "$rel" ]] && { fmt "$nvra" "$t"; continue 3; }; done
+    done <"$db"
+    echo "file $a is not owned by any package"; miss=$((miss + 1)); continue
+  fi
+  while IFS=$'\t' read -r nvra t _; do
+    # match a full NVRA, or a package name followed by its version
+    if [[ $nvra == "$a" || $nvra == "$a"-[0-9]* ]]; then
+      fmt "$nvra" "$t"
+      continue 2
+    fi
+  done <"$db"
+  echo "package $a is not installed"; miss=$((miss + 1))
+done
+exit "$miss"

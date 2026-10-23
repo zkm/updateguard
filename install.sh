@@ -4,7 +4,8 @@
 #   sudo ./install.sh --apply
 #   sudo ./install.sh --uninstall
 # On Arch, prefer `makepkg -si` (see PKGBUILD) so pacman tracks the files.
-# On Debian/Ubuntu this installs apt hooks instead of pacman hooks.
+# On Debian/Ubuntu this installs apt hooks instead of pacman hooks; on Fedora/RHEL a dnf 4
+# plugin, or dnf5 actions on Fedora 41+.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -12,12 +13,24 @@ BIN=/usr/local/bin/updateguard
 HOOKS=/etc/pacman.d/hooks
 APTCONF=/etc/apt/apt.conf.d/05updateguard
 CONF=/etc/updateguard.conf
+DNFCONF=/etc/dnf/plugins/updateguard.conf
+DNF5ACTIONS=/etc/dnf/libdnf5-plugins/actions.d/updateguard.actions
 mode=${1:-plan}
 
 if command -v apt-get >/dev/null 2>&1 && [[ -d /etc/apt/apt.conf.d ]]; then pm=apt
 elif command -v pacman >/dev/null 2>&1; then pm=pacman
-else echo "Neither pacman nor apt found; updateguard supports Arch and Debian/Ubuntu." >&2; exit 1
+elif command -v dnf >/dev/null 2>&1; then
+  # Fedora 41+ links dnf to dnf5; RHEL and older Fedora run the Python dnf 4
+  if [[ $(readlink -f "$(command -v dnf)") == */dnf5 ]]; then pm=dnf5; else pm=dnf; fi
+else echo "None of apt, pacman or dnf found; updateguard supports Arch, Debian/Ubuntu and Fedora/RHEL." >&2; exit 1
 fi
+
+dnf_plugin_dir() {   # dnf 4 loads plugins from dnf-plugins/ next to the dnf package, in dnf's own Python
+  local dnfbin py
+  dnfbin=$(readlink -f "$(command -v dnf)")
+  py=$(sed -n '1s/^#![[:space:]]*\([^[:space:]]*\).*/\1/p' "$dnfbin")
+  "${py:-python3}" -I -c 'import dnf, os; print(os.path.join(os.path.dirname(os.path.dirname(dnf.__file__)), "dnf-plugins"))'
+}
 
 case $mode in
   plan)
@@ -25,6 +38,13 @@ case $mode in
     echo "  updateguard                -> $BIN"
     if [[ $pm == apt ]]; then
       echo "  apt/05updateguard          -> $APTCONF   (commands -> $BIN)"
+    elif [[ $pm == dnf ]]; then
+      echo "  dnf/updateguard.py         -> $(dnf_plugin_dir)/updateguard.py   (BIN -> $BIN)"
+      echo "  dnf/updateguard.conf       -> $DNFCONF"
+    elif [[ $pm == dnf5 ]]; then
+      echo "  dnf/updateguard.actions    -> $DNF5ACTIONS   (commands -> $BIN)"
+      [[ -e /etc/dnf/libdnf5-plugins/actions.conf ]] ||
+        echo "  note: the actions plugin isn't installed; first run: sudo dnf install libdnf5-plugin-actions"
     else
       echo "  05-updateguard-pre.hook    -> $HOOKS/05-updateguard-pre.hook   (Exec -> $BIN)"
       echo "  zzz-updateguard-post.hook  -> $HOOKS/zzz-updateguard-post.hook (Exec -> $BIN)"
@@ -39,6 +59,18 @@ case $mode in
     if [[ $pm == apt ]]; then
       sed "s#/usr/bin/updateguard#$BIN#g" apt/05updateguard >"$APTCONF"
       chmod 644 "$APTCONF"
+    elif [[ $pm == dnf ]]; then
+      plugdir=$(dnf_plugin_dir)
+      install -d "$plugdir"
+      sed "s#^BIN = '/usr/bin/updateguard'#BIN = '$BIN'#" dnf/updateguard.py >"$plugdir/updateguard.py"
+      chmod 644 "$plugdir/updateguard.py"
+      install -Dm644 dnf/updateguard.conf "$DNFCONF"
+    elif [[ $pm == dnf5 ]]; then
+      [[ -e /etc/dnf/libdnf5-plugins/actions.conf ]] ||
+        { echo "Install the dnf5 actions plugin first: sudo dnf install libdnf5-plugin-actions" >&2; exit 1; }
+      install -d "${DNF5ACTIONS%/*}"
+      sed "s#/usr/bin/updateguard#$BIN#g" dnf/updateguard.actions >"$DNF5ACTIONS"
+      chmod 644 "$DNF5ACTIONS"
     else
       install -d "$HOOKS"
       for h in 05-updateguard-pre.hook zzz-updateguard-post.hook; do
@@ -52,7 +84,14 @@ case $mode in
   --uninstall)
     [[ $EUID -eq 0 ]] || { echo "Run with sudo." >&2; exit 1; }
     # the apt hook calls the binary directly, so it must go first or apt breaks
-    rm -f "$APTCONF" "$HOOKS/05-updateguard-pre.hook" "$HOOKS/zzz-updateguard-post.hook" "$BIN"
+    plugdir=""
+    if command -v dnf >/dev/null 2>&1; then plugdir=$(dnf_plugin_dir 2>/dev/null) || plugdir=""; fi
+    rm -f "$APTCONF" "$HOOKS/05-updateguard-pre.hook" "$HOOKS/zzz-updateguard-post.hook" "$DNF5ACTIONS" "$DNFCONF"
+    # where --apply put the dnf 4 plugin, plus the places updateguard doctor looks
+    for d in ${plugdir:+"$plugdir"} /usr{,/local}/lib{,64}/python3*/site-packages/dnf-plugins; do
+      rm -f "$d/updateguard.py" "$d"/__pycache__/updateguard.*.pyc
+    done
+    rm -f "$BIN"
     echo "Removed binary and hooks. Left $CONF, /var/lib/updateguard and any snapshots in place."
     ;;
   *)
