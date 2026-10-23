@@ -325,7 +325,7 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
       <div class="sec-head col">
         <p class="eyebrow">Distributions</p>
         <h2 id="distros-h">Built on Arch, headed for your servers.</h2>
-        <p>Arch updates the kernel and DKMS constantly, which makes it the proving ground. Debian and Ubuntu servers come next, then the RHEL family.</p>
+        <p>Arch updates the kernel and DKMS constantly, which makes it the proving ground. Debian, Ubuntu and the RHEL family are in preview on the way to your servers.</p>
       </div>
       <div class="distros">
         <div class="distro live">
@@ -338,10 +338,10 @@ footer { border-top: 1px solid var(--line); padding-block: 28px 40px; display: f
           <h3>Debian &amp; Ubuntu</h3>
           <p>apt hooks, dpkg-verified kernels, initramfs-tools and GRUB. Most servers run ext4, so it verifies even where it can't snapshot.</p>
         </div>
-        <div class="distro planned">
-          <span class="pill">Planned</span>
+        <div class="distro preview">
+          <span class="pill">Preview</span>
           <h3>Rocky, Alma &amp; Fedora</h3>
-          <p>A dnf plugin, dracut images, <code>kernel-install</code> and BLS entries, and snapper on Fedora's btrfs.</p>
+          <p>dnf 4 plugin and dnf5 actions, rpm-verified kernels, dracut images, <code>kernel-install</code> layouts (GRUB, systemd-boot, UKIs), BLS entries and akmods. Snapper on Fedora's btrfs.</p>
         </div>
       </div>
     </section>
@@ -364,7 +364,7 @@ sudo updateguard doctor</pre>
           </div>
         </div>
         <div class="install">
-          <h3>Debian &amp; Ubuntu <span class="note">(preview)</span></h3>
+          <h3>Debian, Ubuntu, Rocky, Alma &amp; Fedora <span class="note">(preview)</span></h3>
           <div class="code">
             <button class="copy" type="button" data-copy="code-apt">Copy</button>
 <pre id="code-apt">git clone https://github.com/zkm/updateguard.git
@@ -372,6 +372,7 @@ cd updateguard
 sudo ./install.sh --apply
 sudo updateguard doctor</pre>
           </div>
+          <p class="note"><code>install.sh</code> picks apt or dnf hooks. Fedora 41+ (dnf5) needs <code>sudo dnf install libdnf5-plugin-actions</code> first.</p>
         </div>
       </div>
     </section>
@@ -383,7 +384,7 @@ sudo updateguard doctor</pre>
       </div>
       <ol class="roadmap col">
         <li><div><b>Debian &amp; Ubuntu on real machines.</b> <span>Testing on 22.04, 24.04 and Debian 12, a .deb package, and rollback for ext4 servers with LVM snapshots.</span></div></li>
-        <li><div><b>RHEL family.</b> <span>dnf, dracut and BLS support for Rocky, Alma and Fedora.</span></div></li>
+        <li><div><b>RHEL family on real machines.</b> <span>Real transactions on Rocky and Alma 9 and Fedora 41+, an .rpm package, and LVM snapshots for XFS servers.</span></div></li>
         <li><div><b>Fleet reporting.</b> <span><code>updateguard check --json</code> from every machine to one dashboard, with an alert when a server shouldn't be rebooted.</span></div></li>
         <li><div><b>Automatic rollback.</b> <span>Once the checks have proven themselves on real updates.</span></div></li>
       </ol>
@@ -391,7 +392,7 @@ sudo updateguard doctor</pre>
   </main>
 
   <footer>
-    <span>updateguard 0.2.0 · MIT License · © 2026 Zach Schneider</span>
+    <span>updateguard 0.3.0 · MIT License · © 2026 Zach Schneider</span>
     <span class="mono">https://github.com/zkm/updateguard.git</span>
   </footer>
 </div>
