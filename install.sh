@@ -15,6 +15,7 @@ APTCONF=/etc/apt/apt.conf.d/05updateguard
 CONF=/etc/updateguard.conf
 DNFCONF=/etc/dnf/plugins/updateguard.conf
 DNF5ACTIONS=/etc/dnf/libdnf5-plugins/actions.d/updateguard.actions
+SBINLINK=/usr/sbin/updateguard   # RHEL's sudo secure_path leaves out /usr/local/bin
 mode=${1:-plan}
 
 if command -v apt-get >/dev/null 2>&1 && [[ -d /etc/apt/apt.conf.d ]]; then pm=apt
@@ -41,10 +42,12 @@ case $mode in
     elif [[ $pm == dnf ]]; then
       echo "  dnf/updateguard.py         -> $(dnf_plugin_dir)/updateguard.py   (BIN -> $BIN)"
       echo "  dnf/updateguard.conf       -> $DNFCONF"
+      echo "  symlink $SBINLINK -> $BIN   (so sudo finds it)"
     elif [[ $pm == dnf5 ]]; then
       echo "  dnf/updateguard.actions    -> $DNF5ACTIONS   (commands -> $BIN)"
       [[ -e /etc/dnf/libdnf5-plugins/actions.conf ]] ||
         echo "  note: the actions plugin isn't installed; first run: sudo dnf install libdnf5-plugin-actions"
+      echo "  symlink $SBINLINK -> $BIN   (so sudo finds it)"
     else
       echo "  05-updateguard-pre.hook    -> $HOOKS/05-updateguard-pre.hook   (Exec -> $BIN)"
       echo "  zzz-updateguard-post.hook  -> $HOOKS/zzz-updateguard-post.hook (Exec -> $BIN)"
@@ -78,6 +81,11 @@ case $mode in
         chmod 644 "$HOOKS/$h"
       done
     fi
+    if [[ $pm == dnf || $pm == dnf5 ]]; then
+      # never replace a real file, e.g. one an rpm put there
+      if [[ -L $SBINLINK || ! -e $SBINLINK ]]; then ln -sfn "$BIN" "$SBINLINK"
+      else echo "note: $SBINLINK exists and isn't a symlink; left alone. Use: sudo $BIN" >&2; fi
+    fi
     [[ -e $CONF ]] || install -Dm644 updateguard.conf "$CONF"
     echo "Installed. Next: sudo updateguard doctor"
     ;;
@@ -91,6 +99,7 @@ case $mode in
     for d in ${plugdir:+"$plugdir"} /usr{,/local}/lib{,64}/python3*/site-packages/dnf-plugins; do
       rm -f "$d/updateguard.py" "$d"/__pycache__/updateguard.*.pyc
     done
+    [[ -L $SBINLINK && $(readlink "$SBINLINK") == "$BIN" ]] && rm -f "$SBINLINK"
     rm -f "$BIN"
     echo "Removed binary and hooks. Left $CONF, /var/lib/updateguard and any snapshots in place."
     ;;
