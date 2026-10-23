@@ -71,9 +71,13 @@ Fedora / RHEL / Rocky / Alma (preview):
 ```bash
 git clone https://github.com/zkm/updateguard.git && cd updateguard
 ./install.sh                     # shows which dnf hook it will use; changes nothing
-sudo ./install.sh --apply        # binary to /usr/local/bin (linked from /usr/sbin, which sudo searches), plus the dnf hook below
+sudo ./install.sh --apply        # binary to /usr/local/bin, plus the dnf hook below
 sudo updateguard doctor
 ```
+
+RHEL's sudo doesn't search `/usr/local/bin`, so when sudo's `secure_path`
+leaves it out, `install.sh` also links `/usr/bin/updateguard` to the binary.
+It never replaces a file or link there that isn't its own.
 
 dnf 4 (RHEL/Rocky/Alma 8–10, CentOS Stream, Fedora 40 and older) gets a plugin
 in dnf's own `dnf-plugins/` directory plus `/etc/dnf/plugins/updateguard.conf`.
