@@ -100,6 +100,7 @@ LOADERS=()      # human-readable bootloader descriptions
 ENTRY_PATHS=()  # "loader<TAB>title<TAB>root-hint<TAB>path"
 UKIS=()         # unprefixed paths of unified kernel images
 UNREADABLE_ENTRIES=""   # BLS entries dir we couldn't list (RHEL makes it 0700)
+declare -A RPM_ITIME=() # NVRA -> INSTALLTIME, filled by load_kernels so later checks don't re-query rpm
 
 out() { [[ $QUIET == 1 ]] || printf '%s\n' "$*"; }
 
@@ -274,13 +275,9 @@ filter_risky() {
 load_kernels() {   # KERNELS+=("kver<TAB>package"): pkgbase on Arch, linux-image-<kver> on Debian, NVRA on RHEL
   local d pb kver
   KERNELS=()
+  if [[ $FAMILY == rhel ]]; then load_kernels_rhel; return; fi
   for d in "$R$MODROOT"/*/; do
     d=${d%/}; kver=${d##*/}
-    if [[ $FAMILY == rhel ]]; then
-      # removed kernels leave extra/ and weak-updates/ behind, so only count what rpm still owns
-      [[ -f $d/vmlinuz ]] && pb=$(rpm_owner "$d/vmlinuz") && KERNELS+=("$kver"$'\t'"$pb")
-      continue
-    fi
     if [[ $FAMILY == debian ]]; then
       # removed kernels often leave a modules dir behind (DKMS builds), so ask dpkg
       for pb in "linux-image-$kver" "linux-image-unsigned-$kver"; do
@@ -291,6 +288,32 @@ load_kernels() {   # KERNELS+=("kver<TAB>package"): pkgbase on Arch, linux-image
     [[ -f $d/pkgbase ]] || continue
     pb=$(<"$d/pkgbase"); pb=${pb//[[:space:]]/}
     KERNELS+=("$kver"$'\t'"$pb")
+  done
+}
+
+# removed kernels leave extra/ and weak-updates/ behind, so only count what rpm still owns.
+# Each rpm call opens the rpmdb, so ask about every kernel at once.
+load_kernels_rhel() {
+  local d files=() kvers=() lines=() i nvra t
+  for d in "$R$MODROOT"/*/; do
+    d=${d%/}
+    [[ -f $d/vmlinuz ]] || continue
+    files+=("$d/vmlinuz"); kvers+=("${d##*/}")
+  done
+  (( ${#files[@]} )) && command -v rpm >/dev/null 2>&1 || return 0
+  mapfile -t lines < <(rpm -qf --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\t%{INSTALLTIME}\n' "${files[@]}" 2>/dev/null |
+    grep -E '^[^[:space:]]+'$'\t''[0-9]+$')
+  if (( ${#lines[@]} != ${#files[@]} )); then
+    # an unowned file or one with two owners breaks the one-line-per-file order: ask one by one
+    for i in "${!files[@]}"; do
+      nvra=$(rpm_owner "${files[i]}") && KERNELS+=("${kvers[i]}"$'\t'"$nvra")
+    done
+    return 0
+  fi
+  for i in "${!lines[@]}"; do
+    IFS=$'\t' read -r nvra t <<<"${lines[i]}"
+    RPM_ITIME[$nvra]=$t
+    KERNELS+=("${kvers[i]}"$'\t'"$nvra")
   done
 }
 
@@ -328,6 +351,10 @@ fix_reinstall() {   # PKG
 
 fix_kernel_install() {   # KVER: redoes what the kernel package's scriptlets do (copy, dracut, BLS entry)
   printf 'sudo kernel-install add %s %s/%s/vmlinuz' "$1" "$MODROOT" "$1"
+}
+
+fix_uki() {   # PKG KVER
+  if [[ $FAMILY == rhel ]]; then fix_kernel_install "$2"; else printf 'sudo mkinitcpio -p %s' "$1"; fi
 }
 
 fix_initramfs() {   # PKG KVER [create]
@@ -384,6 +411,7 @@ pkg_install_time() {   # PKG -> epoch seconds from the package manager's local d
     return
   fi
   if [[ $FAMILY == rhel ]]; then   # one INSTALLTIME per transaction, before the posttrans dracut run
+    [[ -n ${RPM_ITIME[$1]:-} ]] && { printf '%s\n' "${RPM_ITIME[$1]}"; return 0; }
     command -v rpm >/dev/null 2>&1 || return 1
     rpm -q --qf '%{INSTALLTIME}\n' "$1" 2>/dev/null | head -n1
     return
@@ -416,12 +444,12 @@ check_uki() {   # PKGBASE KVER IMAGE -> rc 0 verified, 1 failed (reported), 2 ca
     rm -rf "$tmp"; return 2
   fi
   if ! same_prefix "$tmp/linux" "$R/usr/lib/modules/$kver/vmlinuz"; then
-    emit FAIL initramfs "$pb: $img contains a different kernel than installed $kver" "sudo mkinitcpio -p $pb"
+    emit FAIL initramfs "$pb: $img contains a different kernel than installed $kver" "$(fix_uki "$pb" "$kver")"
     rc=1
   elif [[ $CHECK_INITRAMFS_CONTENTS == 1 ]] && uki_section "$R$img" .initrd "$tmp/initrd" &&
        listing=$(initramfs_list "$tmp/initrd"); then
     if [[ $listing != *"lib/modules/$kver/"* && $listing == *lib/modules/* ]]; then
-      emit FAIL initramfs "$pb: $img has the right kernel but its initramfs was built for a different one" "sudo mkinitcpio -p $pb"
+      emit FAIL initramfs "$pb: $img has the right kernel but its initramfs was built for a different one" "$(fix_uki "$pb" "$kver")"
       rc=1
     fi
   fi
@@ -432,9 +460,11 @@ check_uki() {   # PKGBASE KVER IMAGE -> rc 0 verified, 1 failed (reported), 2 ca
 }
 
 check_image() {   # PKGBASE KVER IMAGE REFTIME KIND
-  local pb=$1 kver=$2 img=$3 ctime=$4 kind=$5 f="$R$3" mtime listing
+  local pb=$1 kver=$2 img=$3 ctime=$4 kind=$5 f="$R$3" mtime listing regen
+  if [[ $kind == uki ]]; then regen=$(fix_uki "$pb" "$kver"); else regen=$(fix_initramfs "$pb" "$kver"); fi
   if [[ ! -s $f ]]; then
-    emit FAIL initramfs "$pb: $img is missing or empty" "$(fix_initramfs "$pb" "$kver" create)"
+    [[ $kind == uki ]] || regen=$(fix_initramfs "$pb" "$kver" create)
+    emit FAIL initramfs "$pb: $img is missing or empty" "$regen"
     return
   fi
   if [[ $kind == uki ]]; then
@@ -443,8 +473,7 @@ check_image() {   # PKGBASE KVER IMAGE REFTIME KIND
   fi
   mtime=$(stat -c %Y "$f")
   if (( mtime < ctime )); then
-    emit FAIL initramfs "$pb: $img is older than the installed kernel $kver (it was not regenerated)" \
-      "$(fix_initramfs "$pb" "$kver")"
+    emit FAIL initramfs "$pb: $img is older than the installed kernel $kver (it was not regenerated)" "$regen"
     return
   fi
   if [[ $kind == image && $CHECK_INITRAMFS_CONTENTS == 1 ]] && listing=$(initramfs_list "$f"); then
@@ -477,9 +506,40 @@ check_kernel_debian() {   # KVER PKG: /boot/vmlinuz-<kver> + /boot/initrd.img-<k
   check_image "$pkg" "$kver" "$i" "$((ref - 2))" image
 }
 
+# kernel-install's layout decides where the kernel goes: /boot/vmlinuz-<kver> (layout=other, used by
+# GRUB and RHEL), $BOOT/<entry-token>/<kver>/linux (layout=bls, systemd-boot) or a UKI in $BOOT/EFI/Linux.
+rhel_boot_image() {   # KVER -> "kind<TAB>kernel<TAB>initramfs", unprefixed; kind is classic, bls or uki
+  local kver=$1 c d u
+  if [[ ! -e $R/boot/vmlinuz-$kver ]]; then
+    for c in "${ESP_CANDIDATES[@]}"; do
+      for d in "$R$c"/*/"$kver"/; do
+        d=${d%/}; d=${d#"$R"}
+        [[ -e $R$d/linux ]] && { printf 'bls\t%s/linux\t%s/initrd' "$d" "$d"; return; }
+      done
+      for u in "$R$c"/EFI/Linux/*.efi; do
+        uki_is_kver "${u##*/}" "$kver" && { printf 'uki\t%s\t' "${u#"$R"}"; return; }
+      done
+    done
+  fi
+  printf 'classic\t/boot/vmlinuz-%s\t/boot/initramfs-%s.img' "$kver" "$kver"
+}
+
+uki_is_kver() {   # FILENAME KVER: kernel-install names UKIs <entry-token>-<kver>[+<tries>[-<done>]].efi
+  local n=${1%.efi} re='^(.*)\+[0-9]+(-[0-9]+)?$'
+  [[ $n =~ $re ]] && n=${BASH_REMATCH[1]}
+  [[ $n == *-"$2" ]]   # exact suffix: a +debug kernel's UKI must not cover the plain one
+}
+
 check_kernel_rhel() {   # KVER PKG: kernel-install copies the kernel to /boot and dracut builds the initramfs
-  local kver=$1 pkg=$2 k="/boot/vmlinuz-$1" i="/boot/initramfs-$1.img" ref fix
+  local kver=$1 pkg=$2 kind k i ref fix
+  IFS=$'\t' read -r kind k i <<<"$(rhel_boot_image "$kver")"
   fix=$(fix_kernel_install "$kver")
+  ref=$(pkg_install_time "$pkg") || ref=""
+  [[ $ref =~ ^[0-9]+$ ]] || ref=$(stat -c %Z "$R$MODROOT/$kver/vmlinuz")
+  if [[ $kind == uki ]]; then   # one file; check_uki compares the kernel inside it
+    check_image "$pkg" "$kver" "$k" "$((ref - 2))" uki
+    return
+  fi
   if [[ ! -s $R$k ]]; then
     emit FAIL kernel-image "$pkg: $k is missing" "Mount /boot if it's a separate partition, then: $fix"
   elif [[ ! -r $R$k ]]; then
@@ -490,8 +550,6 @@ check_kernel_rhel() {   # KVER PKG: kernel-install copies the kernel to /boot an
   else
     emit OK kernel-image "$pkg: $k matches installed kernel $kver"
   fi
-  ref=$(pkg_install_time "$pkg") || ref=""
-  [[ $ref =~ ^[0-9]+$ ]] || ref=$(stat -c %Z "$R$MODROOT/$kver/vmlinuz")
   check_image "$pkg" "$kver" "$i" "$((ref - 2))" image
 }
 
@@ -582,24 +640,35 @@ check_dkms() {
   done
 }
 
+akmods_names() { local f; for f in "$R"/usr/src/akmods/*-kmod.latest; do f=${f##*/}; printf '%s\n' "${f%-kmod.latest}"; done; }
+
 # akmods (RPM Fusion's NVIDIA and friends) builds kmod-<name>-<kver> RPMs instead of using DKMS.
-# It retries at boot, so a missing one is a warning: slow boot, or a black screen if that build fails too.
+# Its kernel-install plugin builds in the background, so right after an update the build is often
+# still running, and akmods.service retries at boot. Only the newest kernel is checked: the next boot
+# uses it, and akmods never builds for older kernels on its own. A missing kmod is a warning: slow
+# boot, or a black screen if the boot-time build fails too.
 check_akmods() {
   [[ $FAMILY == rhel ]] && command -v rpm >/dev/null 2>&1 || return 0
-  local f m k kver pb names=() missing
-  for f in "$R"/usr/src/akmods/*-kmod.latest; do f=${f##*/}; names+=("${f%-kmod.latest}"); done
+  local m k kver="" pb="" t newest=-1 names=() want=() missing=() have
+  mapfile -t names < <(akmods_names)
   (( ${#names[@]} )) || return 0
   for k in "${KERNELS[@]}"; do
-    IFS=$'\t' read -r kver pb <<<"$k"
-    missing=()
-    for m in "${names[@]}"; do rpm -q "kmod-$m-$kver" >/dev/null 2>&1 || missing+=("kmod-$m"); done
-    if (( ${#missing[@]} )); then
-      emit WARN akmods "$pb: ${missing[*]} not built for $kver yet; akmods retries at boot, and the driver is missing if that fails" \
-        "sudo akmods --force --kernels $kver"
-    else
-      emit OK akmods "$pb: akmods modules built (${names[*]})"
-    fi
+    t=$(pkg_install_time "${k#*$'\t'}") && [[ $t =~ ^[0-9]+$ ]] || t=0
+    (( t > newest )) && { newest=$t; kver=${k%%$'\t'*}; pb=${k#*$'\t'}; }
   done
+  [[ -n $kver ]] || return 0
+  for m in "${names[@]}"; do want+=("kmod-$m-$kver"); done
+  have=$'\n'$(rpm -q --qf '%{NAME}\n' "${want[@]}" 2>/dev/null)$'\n'
+  for m in "${names[@]}"; do [[ $have == *$'\n'"kmod-$m-$kver"$'\n'* ]] || missing+=("kmod-$m"); done
+  if (( ${#missing[@]} == 0 )); then
+    emit OK akmods "$pb: akmods modules built (${names[*]})"
+  elif command -v pgrep >/dev/null 2>&1 && pgrep -x akmods >/dev/null 2>&1; then
+    emit INFO akmods "$pb: akmods is building ${missing[*]} for $kver in the background; check again before you reboot" \
+      "updateguard check"
+  else
+    emit WARN akmods "$pb: ${missing[*]} not built for $kver yet; akmods retries at boot, and the driver is missing if that fails" \
+      "sudo akmods --force --kernels $kver"
+  fi
 }
 
 # ------------------------------------------------------------- bootloader --
@@ -753,9 +822,13 @@ check_boot_entries() {
       key="$loader|$path"
       [[ -n ${SEEN[$key]:-} ]] && continue
       SEEN[$key]=1
-      if [[ -n ${EXPECT[$base]:-} ]]; then
-        emit FAIL boot-entry "$loader entry \"$title\" points to $path, which doesn't exist (kernel ${EXPECT[$base]} is installed)" \
-          "$(regen_hint "$loader" "${EXPECTK[${EXPECT[$base]}]}")"
+      pb=${EXPECT[$base]:-}
+      if [[ -z $pb && $FAMILY == rhel ]]; then   # layout=bls entries point to /<entry-token>/<kver>/linux
+        for k in "${KERNELS[@]}"; do [[ $path == */"${k%%$'\t'*}"/* ]] && pb=${k#*$'\t'}; done
+      fi
+      if [[ -n $pb ]]; then
+        emit FAIL boot-entry "$loader entry \"$title\" points to $path, which doesn't exist (kernel $pb is installed)" \
+          "$(regen_hint "$loader" "${EXPECTK[$pb]}")"
       else
         emit WARN boot-entry "$loader entry \"$title\" points to $path, which doesn't exist (stale entry?)" \
           "$(regen_hint "$loader")"
@@ -765,9 +838,9 @@ check_boot_entries() {
   for u in "${UKIS[@]}"; do
     pb=$(best_pkgbase_match "${u##*/}")
     [[ -n $pb ]] && COVERED[$pb]=1
-    for k in "${KERNELS[@]}"; do   # Fedora names UKIs <machine-id>-<kver>.efi
+    for k in "${KERNELS[@]}"; do
       IFS=$'\t' read -r kver pb <<<"$k"
-      [[ ${u##*/} == *"$kver"* ]] && COVERED[$pb]=1
+      uki_is_kver "${u##*/}" "$kver" && COVERED[$pb]=1
     done
   done
   if [[ -n $UNREADABLE_ENTRIES ]]; then
@@ -778,7 +851,7 @@ check_boot_entries() {
   for k in "${KERNELS[@]}"; do
     IFS=$'\t' read -r kver pb <<<"$k"
     if [[ -z ${COVERED[$pb]:-} ]]; then
-      emit WARN boot-entry "No boot entry found for $pb ($kver)" "$(regen_hint "${LOADERS[0]%% *}")"
+      emit WARN boot-entry "No boot entry found for $pb ($kver)" "$(regen_hint "${LOADERS[0]%% *}" "$kver")"
     fi
   done
   [[ -n $UNREADABLE_ENTRIES ]] && (( n == 0 )) && return
@@ -889,7 +962,8 @@ boot_files() {   # unprefixed paths of kernel/initramfs/microcode/UKI files wort
       continue
     fi
     if [[ $FAMILY == rhel ]]; then
-      printf '%s\n' "/boot/vmlinuz-$kver" "/boot/initramfs-$kver.img" "/boot/config-$kver" "/boot/System.map-$kver"
+      IFS=$'\t' read -r _ v p <<<"$(rhel_boot_image "$kver")"
+      printf '%s\n' "$v" ${p:+"$p"} "/boot/config-$kver" "/boot/System.map-$kver"
       for f in "$R"/boot/loader/entries/*-"$kver".conf; do printf '%s\n' "${f#"$R"}"; done
       continue
     fi
@@ -1040,11 +1114,16 @@ pre_flow() {   # returns 1 only when the transaction should be aborted
 }
 
 cmd_hook_pre() {   # [--apt|--dnf5]
-  # dnf5's actions plugin parses a hook's stdout as commands, so talk to the user on stderr
-  [[ ${1:-} == --dnf5 ]] && exec 1>&2
+  # dnf5's actions plugin parses a hook's stdout as commands, so talk to the user on stderr and keep
+  # stdout (fd 3) for the one command we send. The action has no raise_error, so a crash or a missing
+  # binary only gets logged; `stop=` is the only thing that aborts the transaction.
+  [[ ${1:-} == --dnf5 ]] && exec 3>&1 1>&2
   read_targets "$@"; load_patterns; filter_risky
   (( ${#RISKY[@]} )) || exit 0
-  pre_flow || exit 1
+  if ! pre_flow; then
+    [[ ${1:-} == --dnf5 ]] && printf 'stop=updateguard stopped the transaction (see the messages above)\n' >&3
+    exit 1
+  fi
   exit 0
 }
 
@@ -1148,7 +1227,8 @@ cmd_doctor() {
     fi
     row "apt hooks" "${hooks:-NOT installed (run: sudo ./install.sh --apply)}"
   elif [[ $FAMILY == rhel ]]; then
-    for f in "$R"/usr/lib/python3*/site-packages/dnf-plugins/updateguard.py; do
+    # install.sh asks dnf's own Python where plugins go; that's under one of these
+    for f in "$R"/usr{,/local}/lib{,64}/python3*/site-packages/dnf-plugins/updateguard.py; do
       [[ -f $R/etc/dnf/plugins/updateguard.conf ]] && grep -qiE '^enabled[[:space:]]*=[[:space:]]*(1|true|yes)' "$R/etc/dnf/plugins/updateguard.conf" &&
         hooks="dnf4 plugin (${f#"$R"})"
     done
@@ -1183,7 +1263,10 @@ cmd_doctor() {
     if [[ $FAMILY == debian ]]; then
       pf="no initrd"; [[ -e $R/boot/initrd.img-$kver ]] && pf="initrd"
     elif [[ $FAMILY == rhel ]]; then
-      pf="no initramfs"; [[ -e $R/boot/initramfs-$kver.img ]] && pf="initramfs"
+      IFS=$'\t' read -r mp f pf <<<"$(rhel_boot_image "$kver")"
+      if [[ $mp == uki ]]; then pf="UKI ${f##*/}"
+      elif [[ -e $R$pf ]]; then pf="initramfs"
+      else pf="no initramfs"; fi
     else
       pf="no preset"; [[ -f $(preset_file "$pb") ]] && pf="preset ok"
     fi
@@ -1194,7 +1277,7 @@ cmd_doctor() {
     mods=$(dkms status 2>/dev/null | sed -E 's/[,:].*//' | sort -u | paste -sd' ' -)
     row "DKMS" "${mods:-no modules}"
   fi
-  if [[ $FAMILY == rhel ]] && mods=$(printf '%s\n' "$R"/usr/src/akmods/*-kmod.latest | sed -E 's#.*/##; s/-kmod\.latest$//' | paste -sd' ' -) && [[ -n $mods ]]; then
+  if [[ $FAMILY == rhel ]] && mods=$(akmods_names | paste -sd' ' -) && [[ -n $mods ]]; then
     row "akmods" "$mods"
   fi
   if fstab_root_pins_subvolid; then

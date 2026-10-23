@@ -83,10 +83,12 @@ have finished. dnf5 (Fedora 41+) gets
 `/etc/dnf/libdnf5-plugins/actions.d/updateguard.actions`, which needs
 `sudo dnf install libdnf5-plugin-actions` (1.4+ so it can abort a transaction).
 
-The checks follow the Fedora/RHEL layout: `/boot/vmlinuz-<kver>` must
-byte-match `/usr/lib/modules/<kver>/vmlinuz`, and `/boot/initramfs-<kver>.img`
-must be newer than rpm's install time for the kernel and contain its modules
-(`lsinitrd`). BLS entries in `/boot/loader/entries` are checked, including
+The checks follow kernel-install's layout: `/boot/vmlinuz-<kver>` (GRUB, the
+default) or systemd-boot's `$ESP/<machine-id>/<kver>/linux` must byte-match
+`/usr/lib/modules/<kver>/vmlinuz`, and the initramfs next to it must be newer
+than rpm's install time for the kernel and contain its modules (`lsinitrd`).
+With UKIs (`layout=uki`), the kernel inside `EFI/Linux/<machine-id>-<kver>.efi`
+is compared instead. BLS entries in `/boot/loader/entries` are checked, including
 RHEL's `$tuned_initrd` lines. Kernels are identified by the rpm that owns
 their `vmlinuz`, so leftover `extra/` and `weak-updates/` directories from
 removed kernels are ignored. Fixes point at `kernel-install add`, `dracut -f
@@ -118,12 +120,10 @@ updateguard prune               delete snapshots/boot backups beyond KEEP
   snapshot gets a new subvolume ID.
 - On Arch, dracut, booster and kernel-install layouts get boot-entry checks
   but not the /boot image checks yet.
-- Fedora/RHEL: only the default `/boot/vmlinuz-<kver>` layout gets image
-  checks. systemd-boot's `$ESP/<machine-id>/<kver>/` layout and
-  `kernel-uki-virt` UKIs get boot-entry checks only. PackageKit (GNOME
-  Software, offline updates) doesn't load dnf plugins, so those updates
-  aren't guarded. A missing akmods kmod is a warning, not a failure,
-  because akmods retries at boot.
+- Fedora/RHEL: PackageKit (GNOME Software, offline updates) doesn't load
+  dnf plugins, so those updates aren't guarded. akmods is checked only for
+  the newest kernel; a missing kmod is a warning, not a failure, because
+  akmods retries at boot, and only a note while akmods is still building it.
 - A DKMS module that deliberately excludes a kernel (`BUILD_EXCLUSIVE`) will
   show as a failure for that kernel.
 - UKIs are verified by contents, not timestamps. mkinitcpio builds UKIs with

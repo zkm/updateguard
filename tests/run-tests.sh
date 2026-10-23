@@ -458,6 +458,10 @@ run "" hook-note firefox; run "" hook-pre --dnf5
 export T_MOUNTED="/boot/efi"; conf DRY_RUN=0
 run "" hook-note kernel-core; run "" hook-pre --dnf5; rc_is 1 "unmounted /boot aborts dnf in active mode"
 has "run dnf again" "abort message names dnf"
+run "" hook-note kernel-core
+OUT=$(env UG_ROOT="$ROOT" UG_CONF="$ROOT/etc/updateguard.conf" UG_RUN_DIR="$ROOT/run/updateguard" "$UG" hook-pre --dnf5 2>/dev/null)
+[[ $OUT == "stop=updateguard stopped the transaction"* && $OUT != *$'\n'* ]] && ok "dnf5 abort is a single stop= line on stdout" || bad "dnf5 abort is a single stop= line on stdout"
+grep -q 'raise_error=' "$HERE/../dnf/updateguard.actions" && bad "dnf5 actions don't use raise_error (a missing binary would break dnf)" || ok "dnf5 actions don't use raise_error (a missing binary would break dnf)"
 
 echo "== 18. Fedora: failures and fixes"
 make_fedora
@@ -465,6 +469,19 @@ printf '%s\t%s\t%s\n' "kmod-other-1-1.fc41.x86_64" 0 "" >"$ROOT/rpmdb.tmp"
 grep -v '^kmod-nvidia' "$ROOT/rpmdb.txt" >>"$ROOT/rpmdb.tmp"; mv "$ROOT/rpmdb.tmp" "$ROOT/rpmdb.txt"
 run "" check; has "kmod-nvidia not built for $FKVER yet" "missing akmods kmod warned"
 has "sudo akmods --force --kernels $FKVER" "akmods rebuild suggested"
+T_PGREP=akmods run "" check; has "akmods is building kmod-nvidia for $FKVER in the background" "akmods build in progress is INFO"
+hasnt "not built for" "no akmods warning while it's still building"
+make_fedora
+OKVER=6.10.12-200.fc40.x86_64
+printf 'KERNEL-%s\n' "$OKVER" >"$ROOT/usr/lib/modules/$OKVER/vmlinuz"; cp "$ROOT/usr/lib/modules/$OKVER/vmlinuz" "$ROOT/boot/vmlinuz-$OKVER"
+printf 'usr/lib/modules/%s/x.ko\n' "$OKVER" >"$ROOT/boot/initramfs-$OKVER.img"
+printf '%s\t%s\t%s\n' "kernel-core-$OKVER" "$(date -d '2026-09-01' +%s)" "/usr/lib/modules/$OKVER/vmlinuz" >>"$ROOT/rpmdb.txt"
+export T_RPM_LOG="$ROOT/rpm.log"
+run "" check; hasnt "kmod-nvidia not built for $OKVER" "akmods only checks the newest kernel"
+has "No boot entry found for kernel-core-$OKVER ($OKVER)" "kernel without a BLS entry warned"
+has "sudo kernel-install add $OKVER /usr/lib/modules/$OKVER/vmlinuz" "missing BLS entry: kernel-install add, not remove"
+[[ $(grep -c '^rpm -qf ' "$ROOT/rpm.log") == 1 ]] && ok "one rpm -qf call for all kernels" || bad "one rpm -qf call for all kernels ($(grep -c '^rpm -qf ' "$ROOT/rpm.log"))"
+unset T_RPM_LOG
 make_fedora
 DKVER=6.11.4-301.fc41.x86_64+debug
 mkdir -p "$ROOT/usr/lib/modules/$DKVER"; printf 'DEBUG\n' >"$ROOT/usr/lib/modules/$DKVER/vmlinuz"
@@ -475,6 +492,41 @@ has "sudo dnf install kernel-debug-devel-$FKVER && sudo dkms autoinstall -k $DKV
 has "kernel-debug-core-$FKVER: /boot/vmlinuz-$DKVER is missing" "missing /boot kernel detected"
 has "sudo kernel-install add $DKVER /usr/lib/modules/$DKVER/vmlinuz" "kernel-install suggested"
 has "sudo dracut -f --kver $DKVER" "dracut suggested for missing initramfs"
+mkdir -p "$ROOT/boot/efi/EFI/Linux"; printf 'UKI\n' >"$ROOT/boot/efi/EFI/Linux/$MID-$DKVER.efi"
+mv "$ROOT/boot/loader/entries/$MID-$FKVER.conf" "$ROOT/boot/$MID-$FKVER.conf.off"
+run "" check; has "No boot entry found for $FPKG ($FKVER)" "a +debug UKI doesn't cover the plain kernel"
+hasnt "No boot entry found for kernel-debug-core" "the +debug UKI covers the debug kernel"
+
+echo "== 19. Fedora: kernel-install layout=bls and layout=uki"
+make_fedora   # systemd-boot on the ESP at /boot/efi, kernel-install layout=bls
+rm "$ROOT/boot/vmlinuz-$FKVER" "$ROOT/boot/initramfs-$FKVER.img" "$ROOT/boot/loader/entries/$MID-$FKVER.conf"
+rm -rf "$ROOT/boot/loader" "$ROOT/boot/grub2"
+mkdir -p "$ROOT/boot/efi/$MID/$FKVER" "$ROOT/boot/efi/loader/entries" "$ROOT/boot/efi/EFI/systemd"
+: >"$ROOT/boot/efi/EFI/systemd/systemd-bootx64.efi"
+cp "$ROOT/usr/lib/modules/$FKVER/vmlinuz" "$ROOT/boot/efi/$MID/$FKVER/linux"
+printf 'usr/lib/modules/%s/kernel/drivers/x.ko\n' "$FKVER" >"$ROOT/boot/efi/$MID/$FKVER/initrd"
+touch -d '2026-10-02' "$ROOT/boot/efi/$MID/$FKVER/initrd"
+printf 'title Fedora Linux\nversion %s\nlinux /%s/%s/linux\ninitrd /%s/%s/initrd\n' "$FKVER" "$MID" "$FKVER" "$MID" "$FKVER" \
+  >"$ROOT/boot/efi/loader/entries/$MID-$FKVER.conf"
+run "" check; rc_is 0 "layout=bls system is healthy"
+has "$FPKG: /boot/efi/$MID/$FKVER/linux matches installed kernel $FKVER" "kernel found in the BLS layout dir"
+has "/boot/efi/$MID/$FKVER/initrd is current" "initrd found in the BLS layout dir"
+hasnt "No boot entry found" "BLS layout entry covers the kernel"
+rm "$ROOT/boot/efi/$MID/$FKVER/initrd"
+run "" check; has "(kernel $FPKG is installed)" "missing BLS-layout initrd is a FAIL tied to the kernel"
+has "sudo kernel-install add $FKVER" "kernel-install fixes the BLS-layout entry"
+make_fedora   # layout=uki: one UKI on the ESP, no /boot/vmlinuz
+rm "$ROOT/boot/vmlinuz-$FKVER" "$ROOT/boot/initramfs-$FKVER.img" "$ROOT/boot/loader/entries/$MID-$FKVER.conf"
+mkdir -p "$ROOT/boot/efi/EFI/Linux"; printf 'UKI\n' >"$ROOT/boot/efi/EFI/Linux/$MID-$FKVER+3-0.efi"
+touch -d '2026-10-02' "$ROOT/boot/efi/EFI/Linux/$MID-$FKVER+3-0.efi"
+run "" check; rc_is 0 "layout=uki system is healthy"
+hasnt "is missing" "no missing /boot/vmlinuz FAIL with UKIs"
+hasnt "No boot entry found" "UKI with boot counting covers the kernel"
+run "" doctor; has "$FPKG $FKVER (UKI $MID-$FKVER+3-0.efi, headers)" "doctor shows the kernel's UKI"
+touch -d '2026-09-01' "$ROOT/boot/efi/EFI/Linux/$MID-$FKVER+3-0.efi"
+run "" check; has "older than the installed kernel" "stale UKI detected"
+has "sudo kernel-install add $FKVER" "kernel-install regenerates the UKI, not mkinitcpio"
+hasnt "mkinitcpio" "no Arch fix on Fedora"
 
 # make_rocky: Rocky 8, xfs root, /boot on the root fs, ESP at /boot/efi, RHEL-style BLS, DKMS
 RKVER=4.18.0-553.176.1.el8_10.x86_64
@@ -515,7 +567,7 @@ EOF
   export T_SNAPPER=0 T_SOURCE=/dev/nvme0n1p3 T_UNAME_R=$RKVER T_DF_AVAIL=400 T_BTRFS_FAIL=0
 }
 
-echo "== 19. Rocky 8: healthy system, then failures"
+echo "== 20. Rocky 8: healthy system, then failures"
 make_rocky
 run "" check; rc_is 0 "check exits 0"
 has "$RPKG: /boot/vmlinuz-$RKVER matches installed kernel" "Rocky kernel verified"
@@ -557,7 +609,7 @@ if (( EUID != 0 )); then
   chmod 755 "$ROOT/boot/loader/entries"
 fi
 
-echo "== 20. dnf 4 plugin (fake dnf module)"
+echo "== 21. dnf 4 plugin (fake dnf module)"
 if command -v python3 >/dev/null; then
   W=$(mktemp -d "${TMPDIR:-/tmp}/ugdnf.XXXXXX")
   # shellcheck disable=SC2016  # the fake binary expands these itself

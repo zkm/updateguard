@@ -84,9 +84,13 @@ case $mode in
   --uninstall)
     [[ $EUID -eq 0 ]] || { echo "Run with sudo." >&2; exit 1; }
     # the apt hook calls the binary directly, so it must go first or apt breaks
-    rm -f "$APTCONF" "$HOOKS/05-updateguard-pre.hook" "$HOOKS/zzz-updateguard-post.hook" \
-      "$DNF5ACTIONS" "$DNFCONF" /usr/lib/python3*/site-packages/dnf-plugins/updateguard.py \
-      /usr/lib/python3*/site-packages/dnf-plugins/__pycache__/updateguard.*.pyc
+    plugdir=""
+    if command -v dnf >/dev/null 2>&1; then plugdir=$(dnf_plugin_dir 2>/dev/null) || plugdir=""; fi
+    rm -f "$APTCONF" "$HOOKS/05-updateguard-pre.hook" "$HOOKS/zzz-updateguard-post.hook" "$DNF5ACTIONS" "$DNFCONF"
+    # where --apply put the dnf 4 plugin, plus the places updateguard doctor looks
+    for d in ${plugdir:+"$plugdir"} /usr{,/local}/lib{,64}/python3*/site-packages/dnf-plugins; do
+      rm -f "$d/updateguard.py" "$d"/__pycache__/updateguard.*.pyc
+    done
     rm -f "$BIN"
     echo "Removed binary and hooks. Left $CONF, /var/lib/updateguard and any snapshots in place."
     ;;
