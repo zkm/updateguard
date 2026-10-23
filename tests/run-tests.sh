@@ -478,7 +478,8 @@ printf 'usr/lib/modules/%s/x.ko\n' "$OKVER" >"$ROOT/boot/initramfs-$OKVER.img"
 printf '%s\t%s\t%s\n' "kernel-core-$OKVER" "$(date -d '2026-09-01' +%s)" "/usr/lib/modules/$OKVER/vmlinuz" >>"$ROOT/rpmdb.txt"
 export T_RPM_LOG="$ROOT/rpm.log"
 run "" check; hasnt "kmod-nvidia not built for $OKVER" "akmods only checks the newest kernel"
-has "No boot entry found for kernel-core-$OKVER ($OKVER)" "kernel without a BLS entry warned"
+has "No boot entry found for kernel-core-$OKVER" "kernel without a BLS entry warned"
+hasnt "kernel-core-$OKVER ($OKVER)" "boot-entry warning doesn't repeat the kver"
 has "sudo kernel-install add $OKVER /usr/lib/modules/$OKVER/vmlinuz" "missing BLS entry: kernel-install add, not remove"
 [[ $(grep -c '^rpm -qf ' "$ROOT/rpm.log") == 1 ]] && ok "one rpm -qf call for all kernels" || bad "one rpm -qf call for all kernels ($(grep -c '^rpm -qf ' "$ROOT/rpm.log"))"
 unset T_RPM_LOG
@@ -495,7 +496,7 @@ has "sudo kernel-install add $DKVER /usr/lib/modules/$DKVER/vmlinuz" "kernel-ins
 has "sudo dracut -f --kver $DKVER" "dracut suggested for missing initramfs"
 mkdir -p "$ROOT/boot/efi/EFI/Linux"; printf 'UKI\n' >"$ROOT/boot/efi/EFI/Linux/$MID-$DKVER.efi"
 mv "$ROOT/boot/loader/entries/$MID-$FKVER.conf" "$ROOT/boot/$MID-$FKVER.conf.off"
-run "" check; has "No boot entry found for $FPKG ($FKVER)" "a +debug UKI doesn't cover the plain kernel"
+run "" check; has "No boot entry found for $FPKG" "a +debug UKI doesn't cover the plain kernel"
 hasnt "No boot entry found for kernel-debug-core" "the +debug UKI covers the debug kernel"
 
 echo "== 19. Fedora: kernel-install layout=bls and layout=uki"

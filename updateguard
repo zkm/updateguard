@@ -854,7 +854,7 @@ check_boot_entries() {
   for k in "${KERNELS[@]}"; do
     IFS=$'\t' read -r kver pb <<<"$k"
     if [[ -z ${COVERED[$pb]:-} ]]; then
-      emit WARN boot-entry "No boot entry found for $pb ($kver)" "$(regen_hint "${LOADERS[0]%% *}" "$kver")"
+      emit WARN boot-entry "No boot entry found for $(kernel_label "$pb" "$kver")" "$(regen_hint "${LOADERS[0]%% *}" "$kver")"
     fi
   done
   [[ -n $UNREADABLE_ENTRIES ]] && (( n == 0 )) && return
