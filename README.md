@@ -1,9 +1,9 @@
 # updateguard
 
 Snapshot before risky OS updates, then verify the machine will still boot
-before you reboot. v0.2.0: Arch and CachyOS (pacman), plus Debian and Ubuntu
-(apt) and Fedora, RHEL, Rocky and Alma (dnf) in preview. (Name is a placeholder; check the AUR and GitHub before
-publishing.)
+before you reboot. v0.3.0: Arch and CachyOS (pacman), plus Debian and Ubuntu
+(apt) and Fedora, RHEL, Rocky and Alma (dnf) in preview. (Name is a
+placeholder; check the AUR and GitHub before publishing.)
 
 ## What it does
 
@@ -151,8 +151,7 @@ first, then the RHEL family. Arch stays the dogfooding platform.
 2. **RHEL family** (in progress): dnf 4 plugin and dnf5 actions, rpm-based
    kernel checks, dracut (`lsinitrd`), `kernel-install` and BLS entries, akmods.
    Next: real transactions on Rocky/Alma 9 and Fedora 41+ VMs, an `.rpm`
-   package, LVM snapshots for XFS/ext4 servers, and the systemd-boot
-   `kernel-install` layout.
+   package, and LVM snapshots for XFS/ext4 servers.
 3. **Fleet reporting**: `check --json` from every machine to a dashboard, with
    alerts when a server shouldn't be rebooted.
 4. **Automatic rollback**, once the checks have proven themselves on real
