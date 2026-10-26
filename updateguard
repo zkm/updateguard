@@ -9,7 +9,7 @@
 set -uo pipefail
 shopt -s nullglob extglob
 
-readonly VERSION=0.3.0
+readonly VERSION=0.3.1
 readonly R="${UG_ROOT:-}"                  # test harness only; empty on real systems
 readonly CONF="${UG_CONF:-$R/etc/updateguard.conf}"
 readonly STATE_DIR="$R/var/lib/updateguard"

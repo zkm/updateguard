@@ -1,6 +1,6 @@
 # Maintainer: Zach Schneider <zachschneider@gmail.com>
 pkgname=updateguard
-pkgver=0.3.0
+pkgver=0.3.1
 pkgrel=1
 pkgdesc="Snapshot before risky pacman updates and verify the system will still boot afterwards"
 arch=('any')
