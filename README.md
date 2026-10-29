@@ -1,5 +1,17 @@
 # updateguard
 
+[![CI](https://github.com/zkm/updateguard/actions/workflows/ci.yml/badge.svg)](https://github.com/zkm/updateguard/actions/workflows/ci.yml)
+[![Website](https://img.shields.io/website?url=https%3A%2F%2Fzkm.github.io%2Fupdateguard%2F&label=website)](https://zkm.github.io/updateguard/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+![Bash](https://img.shields.io/badge/Bash-4EAA25?logo=gnubash&logoColor=white)
+![ShellCheck clean](https://img.shields.io/badge/ShellCheck-clean-brightgreen)
+![Python 3.6+ (dnf plugin)](https://img.shields.io/badge/Python-3.6%2B%20(dnf%20plugin)-3776AB?logo=python&logoColor=white)
+
+![Arch Linux / CachyOS: supported](https://img.shields.io/badge/Arch%20%2F%20CachyOS-supported-1793D1?logo=archlinux&logoColor=white)
+![Debian / Ubuntu: preview](https://img.shields.io/badge/Debian%20%2F%20Ubuntu-preview-A81D33?logo=debian&logoColor=white)
+![Fedora / RHEL: preview](https://img.shields.io/badge/Fedora%20%2F%20RHEL-preview-EE0000?logo=redhat&logoColor=white)
+
 Snapshot before risky OS updates, then verify the machine will still boot
 before you reboot. v0.3.1: Arch and CachyOS (pacman), plus Debian and Ubuntu
 (apt) and Fedora, RHEL, Rocky and Alma (dnf) in preview. (Name is a
